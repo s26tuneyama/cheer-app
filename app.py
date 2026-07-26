@@ -8,6 +8,7 @@ from ultralytics import YOLO
 
 # ==========================================
 # 1. 知識ベース（ルールとアドバイス）
+# ！！！ここは前回から一切変更していません！！！（アーキテクチャの勝利です）
 # ==========================================
 KNOWLEDGE_BASE_JSON = """
 {
@@ -35,10 +36,11 @@ KNOWLEDGE_BASE_JSON = """
 knowledge = json.loads(KNOWLEDGE_BASE_JSON)
 
 # ==========================================
-# 2. 処理機構（ロジック層）★ここを大改修！
+# 2. 処理機構（ロジック層）★ここを改良！
 # ==========================================
 def calculate_angle(a, b, c):
-    a, b, c = np.array(a), np.array(b), np.array(c)
+    # (x, y, conf) のうち (x, y) だけを使って計算するように微調整
+    a, b, c = np.array(a[:2]), np.array(b[:2]), np.array(c[:2])
     ba = a - b
     bc = c - b
     cosine_angle = np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc))
@@ -46,8 +48,6 @@ def calculate_angle(a, b, c):
 
 def extract_jump_metrics(video_path, model):
     cap = cv2.VideoCapture(video_path)
-    
-    # 全フレームの「一番高い人（ジャンパー）」のデータを記録するリスト
     history = []
     
     while cap.isOpened():
@@ -57,24 +57,22 @@ def extract_jump_metrics(video_path, model):
         results = model(frame, verbose=False)
         result = results[0]
         
-        # フレーム内に人が検出された場合
         if len(result.keypoints) > 0:
             best_kpts = None
             min_hip_y_in_frame = float('inf')
             
-            # 検出された全ての人(kpts)をチェックし、一番腰が高い人（Y座標が小さい人）を探す
-            for kpts in result.keypoints.xy:
+            # .xy ではなく .data を使うことで、AIの「確信度(Confidence)」も取得
+            for kpts in result.keypoints.data:
                 kpts_np = kpts.cpu().numpy()
                 l_hip, r_hip = kpts_np[11], kpts_np[12]
                 
-                # 腰の座標が取れている場合
-                if l_hip[1] > 0 and r_hip[1] > 0:
+                # 【改良1】AIの確信度が低い（0.5未満）誤認ノイズは無視する
+                if l_hip[2] > 0.5 and r_hip[2] > 0.5:
                     hip_y = (l_hip[1] + r_hip[1]) / 2
                     if hip_y < min_hip_y_in_frame:
                         min_hip_y_in_frame = hip_y
                         best_kpts = kpts_np
             
-            # そのフレーム内で一番高い人を記録
             if best_kpts is not None:
                 history.append({
                     "frame": frame.copy(),
@@ -88,27 +86,28 @@ def extract_jump_metrics(video_path, model):
         return {}, None, None, None, None
 
     # --- ① 真のAPEX（頂点）を探す ---
-    # 動画全体を通して、腰の位置(hip_y)が最も小さかった（高かった）フレームを特定
     apex_idx = min(range(len(history)), key=lambda i: history[i]["hip_y"])
     apex_data = history[apex_idx]
     apex_frame, apex_kpts = apex_data["frame"], apex_data["kpts"]
     
     # --- ② スナップダウン（下降）を探す ---
-    # APEX以降のフレームだけを見て、足首が膝より下になった瞬間を探す
     snap_frame, snap_kpts = None, None
     for i in range(apex_idx + 1, len(history)):
         data = history[i]
         kpts = data["kpts"]
-        l_knee, r_knee = kpts[13], kpts[14]
+        l_hip, r_hip = kpts[11], kpts[12]
         l_ankle, r_ankle = kpts[15], kpts[16]
         
-        # 足首(Y座標)が膝(Y座標)より大きくなった＝脚が下りた（閉じた）
-        if l_ankle[1] > l_knee[1] and r_ankle[1] > r_knee[1]:
+        # 【改良2】左右の足首の距離と、左右の腰幅を計算
+        ankle_dist = np.linalg.norm(l_ankle[:2] - r_ankle[:2])
+        hip_width = np.linalg.norm(l_hip[:2] - r_hip[:2])
+        
+        # 足首が腰より下にあり、かつ「足首の距離が腰幅の1.5倍以内に近づいた（＝脚が閉じた）」瞬間をスナップダウンとする
+        if l_ankle[1] > l_hip[1] and r_ankle[1] > r_hip[1] and ankle_dist < (hip_width * 1.5):
             snap_frame = data["frame"]
             snap_kpts = kpts
             break
             
-    # （保険）もし見つからなかったら、APEXから数フレーム後をスナップダウンとする
     if snap_frame is None and len(history) > apex_idx + 5:
         snap_frame = history[apex_idx + 5]["frame"]
         snap_kpts = history[apex_idx + 5]["kpts"]
@@ -149,18 +148,22 @@ def draw_custom_keypoints(image, keypoints, phase_name):
     }
     
     for idx, (label, color) in targets.items():
-        x, y = int(keypoints[idx][0]), int(keypoints[idx][1])
-        if x != 0 and y != 0:  
-            cv2.circle(img_draw, (x, y), 6, color, -1)
+        x, y, conf = keypoints[idx][0], keypoints[idx][1], keypoints[idx][2]
+        # 確信度が極端に低い部位（0.3未満）は描画しない
+        if x != 0 and y != 0 and conf > 0.3:  
+            cv2.circle(img_draw, (int(x), int(y)), 6, color, -1)
             
-    pts_r = [(int(keypoints[i][0]), int(keypoints[i][1])) for i in [6, 12, 14, 16]]
-    pts_l = [(int(keypoints[i][0]), int(keypoints[i][1])) for i in [5, 11, 13, 15]]
+    pts_r = [(int(keypoints[i][0]), int(keypoints[i][1])) for i in [6, 12, 14, 16] if keypoints[i][2] > 0.3]
+    pts_l = [(int(keypoints[i][0]), int(keypoints[i][1])) for i in [5, 11, 13, 15] if keypoints[i][2] > 0.3]
     
-    for pts in [pts_r, pts_l]:
-        if all(p[0] != 0 for p in pts):
-            cv2.line(img_draw, pts[0], pts[1], (255, 255, 255), 2)
-            cv2.line(img_draw, pts[1], pts[2], (255, 255, 255), 2)
-            cv2.line(img_draw, pts[2], pts[3], (255, 255, 255), 2)
+    if len(pts_r) == 4:
+        cv2.line(img_draw, pts_r[0], pts_r[1], (255, 255, 255), 2)
+        cv2.line(img_draw, pts_r[1], pts_r[2], (255, 255, 255), 2)
+        cv2.line(img_draw, pts_r[2], pts_r[3], (255, 255, 255), 2)
+    if len(pts_l) == 4:
+        cv2.line(img_draw, pts_l[0], pts_l[1], (255, 255, 255), 2)
+        cv2.line(img_draw, pts_l[1], pts_l[2], (255, 255, 255), 2)
+        cv2.line(img_draw, pts_l[2], pts_l[3], (255, 255, 255), 2)
             
     cv2.putText(img_draw, phase_name, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 3, cv2.LINE_AA)
     return img_draw
