@@ -35,7 +35,7 @@ KNOWLEDGE_BASE_JSON = """
 knowledge = json.loads(KNOWLEDGE_BASE_JSON)
 
 # ==========================================
-# 2. 処理機構（ロジック層）
+# 2. 処理機構（ロジック層）★ここを大改修！
 # ==========================================
 def calculate_angle(a, b, c):
     a, b, c = np.array(a), np.array(b), np.array(c)
@@ -46,47 +46,74 @@ def calculate_angle(a, b, c):
 
 def extract_jump_metrics(video_path, model):
     cap = cv2.VideoCapture(video_path)
-    apex_frame, snap_frame = None, None
-    apex_kpts, snap_kpts = None, None
-    min_y = float('inf') 
-    phase = "ASCENT"
-    frame_count = 0
+    
+    # 全フレームの「一番高い人（ジャンパー）」のデータを記録するリスト
+    history = []
     
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret: break
-        frame_count += 1
-        if frame_count % 2 != 0: continue
 
         results = model(frame, verbose=False)
         result = results[0]
         
+        # フレーム内に人が検出された場合
         if len(result.keypoints) > 0:
-            keypoints = result.keypoints.xy[0].cpu().numpy()
-            l_hip, r_hip = keypoints[11], keypoints[12]
+            best_kpts = None
+            min_hip_y_in_frame = float('inf')
             
-            if l_hip[1] > 0 and r_hip[1] > 0:
-                current_y = (l_hip[1] + r_hip[1]) / 2
+            # 検出された全ての人(kpts)をチェックし、一番腰が高い人（Y座標が小さい人）を探す
+            for kpts in result.keypoints.xy:
+                kpts_np = kpts.cpu().numpy()
+                l_hip, r_hip = kpts_np[11], kpts_np[12]
                 
-                # 頂点の検出
-                if current_y < min_y:
-                    min_y = current_y
-                    apex_frame = frame.copy()
-                    apex_kpts = keypoints
-                    phase = "ASCENT"
-                # 下降の検出
-                elif current_y > min_y + 20 and phase == "ASCENT":
-                    phase = "DESCENT"
-                    
-                # スナップダウンの検出
-                if phase == "DESCENT" and snap_frame is None:
-                    l_knee, r_knee = keypoints[13], keypoints[14]
-                    l_ankle, r_ankle = keypoints[15], keypoints[16]
-                    if l_ankle[1] > l_knee[1] and r_ankle[1] > r_knee[1]:
-                        snap_frame = frame.copy()
-                        snap_kpts = keypoints
+                # 腰の座標が取れている場合
+                if l_hip[1] > 0 and r_hip[1] > 0:
+                    hip_y = (l_hip[1] + r_hip[1]) / 2
+                    if hip_y < min_hip_y_in_frame:
+                        min_hip_y_in_frame = hip_y
+                        best_kpts = kpts_np
+            
+            # そのフレーム内で一番高い人を記録
+            if best_kpts is not None:
+                history.append({
+                    "frame": frame.copy(),
+                    "kpts": best_kpts,
+                    "hip_y": min_hip_y_in_frame
+                })
+                
     cap.release()
     
+    if not history:
+        return {}, None, None, None, None
+
+    # --- ① 真のAPEX（頂点）を探す ---
+    # 動画全体を通して、腰の位置(hip_y)が最も小さかった（高かった）フレームを特定
+    apex_idx = min(range(len(history)), key=lambda i: history[i]["hip_y"])
+    apex_data = history[apex_idx]
+    apex_frame, apex_kpts = apex_data["frame"], apex_data["kpts"]
+    
+    # --- ② スナップダウン（下降）を探す ---
+    # APEX以降のフレームだけを見て、足首が膝より下になった瞬間を探す
+    snap_frame, snap_kpts = None, None
+    for i in range(apex_idx + 1, len(history)):
+        data = history[i]
+        kpts = data["kpts"]
+        l_knee, r_knee = kpts[13], kpts[14]
+        l_ankle, r_ankle = kpts[15], kpts[16]
+        
+        # 足首(Y座標)が膝(Y座標)より大きくなった＝脚が下りた（閉じた）
+        if l_ankle[1] > l_knee[1] and r_ankle[1] > r_knee[1]:
+            snap_frame = data["frame"]
+            snap_kpts = kpts
+            break
+            
+    # （保険）もし見つからなかったら、APEXから数フレーム後をスナップダウンとする
+    if snap_frame is None and len(history) > apex_idx + 5:
+        snap_frame = history[apex_idx + 5]["frame"]
+        snap_kpts = history[apex_idx + 5]["kpts"]
+
+    # --- ③ 角度の計算 ---
     metrics = {}
     if apex_kpts is not None and snap_kpts is not None:
         metrics["r_knee_angle"] = calculate_angle(apex_kpts[12], apex_kpts[14], apex_kpts[16])
@@ -96,7 +123,6 @@ def extract_jump_metrics(video_path, model):
         l_waist = calculate_angle(snap_kpts[5], snap_kpts[11], snap_kpts[13])
         metrics["waist_flexion"] = (r_waist + l_waist) / 2
         
-    # 計測データと一緒に、画像と座標データも画面表示用に返す
     return metrics, apex_frame, apex_kpts, snap_frame, snap_kpts
 
 # ==========================================
@@ -114,7 +140,6 @@ def evaluate_metrics(metrics, rules):
     return tags
 
 def draw_custom_keypoints(image, keypoints, phase_name):
-    """画面表示用に骨格を画像に描き込む関数"""
     img_draw = image.copy()
     targets = {
         5: ("L-Shoulder", (255, 165, 0)), 6: ("R-Shoulder", (255, 165, 0)),
@@ -164,26 +189,22 @@ if uploaded_file is not None:
             else:
                 tags = evaluate_metrics(metrics, knowledge["rules"])
                 
-                # 画像の描画（表示層で行う）
                 img_apex = draw_custom_keypoints(apex_frame, apex_kpts, "APEX (Peak)")
                 img_snap = draw_custom_keypoints(snap_frame, snap_kpts, "SNAP DOWN")
                 
                 st.success("一連のフォームを診断しました！")
                 
-                # 2枚の画像を横に並べて表示
                 col_img1, col_img2 = st.columns(2)
                 with col_img1:
                     st.image(cv2.cvtColor(img_apex, cv2.COLOR_BGR2RGB), caption="① 開脚の頂点", use_container_width=True)
                 with col_img2:
                     st.image(cv2.cvtColor(img_snap, cv2.COLOR_BGR2RGB), caption="② スナップダウン時", use_container_width=True)
                 
-                # 数値データの表示
                 col1, col2, col3 = st.columns(3)
                 col1.metric(label="右膝角度 (頂点)", value=f"{metrics['r_knee_angle']:.1f}度")
                 col2.metric(label="左膝角度 (頂点)", value=f"{metrics['l_knee_angle']:.1f}度")
                 col3.metric(label="腰の角度 (下降時)", value=f"{metrics['waist_flexion']:.1f}度")
                 
-                # 知識ベースからのアドバイス表示
                 st.markdown("### 💡 診断結果とアドバイス")
                 for tag in tags:
                     for item in knowledge["advices"].get(tag, []):
