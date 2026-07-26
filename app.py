@@ -7,11 +7,39 @@ import json
 from ultralytics import YOLO
 
 # ==========================================
-# 1. 知識ベース（ルールとアドバイス）
-# ※ここは一切変更なし（アーキテクチャの完全分離）
+# 0. フィードバック集計用の設定
+# ==========================================
+FEEDBACK_FILE = "feedback_counts.json"
+
+def load_feedback():
+    if os.path.exists(FEEDBACK_FILE):
+        with open(FEEDBACK_FILE, "r") as f:
+            return json.load(f)
+    return {"helpful": 0, "not_helpful": 0}
+
+def save_feedback(helpful_count, not_helpful_count):
+    with open(FEEDBACK_FILE, "w") as f:
+        json.dump({"helpful": helpful_count, "not_helpful": not_helpful_count}, f)
+
+if "feedback_given" not in st.session_state:
+    st.session_state.feedback_given = False
+
+# ==========================================
+# 1. 知識ベース（ルール・制約・アドバイス）
+# ★オントロジー（物理的制約）もここに定義！
 # ==========================================
 KNOWLEDGE_BASE_JSON = """
 {
+  "ontology": {
+    "phases": {
+      "SNAP_DOWN": {
+        "constraints": {
+          "knee_must_be_below": "hip",
+          "ankle_must_be_below_hip_margin": 20
+        }
+      }
+    }
+  },
   "rules": [
     {"metric": "r_knee_angle", "operator": "<", "threshold": 160, "tag": "RIGHT_KNEE_BENT"},
     {"metric": "l_knee_angle", "operator": "<", "threshold": 160, "tag": "LEFT_KNEE_BENT"},
@@ -36,7 +64,7 @@ KNOWLEDGE_BASE_JSON = """
 knowledge = json.loads(KNOWLEDGE_BASE_JSON)
 
 # ==========================================
-# 2. 処理機構（ロジック層）★オントロジー（制約）を追加！
+# 2. 処理機構（汎用的なロジック層）
 # ==========================================
 def calculate_angle(a, b, c):
     a, b, c = np.array(a), np.array(b), np.array(c)
@@ -46,29 +74,25 @@ def calculate_angle(a, b, c):
     return np.degrees(np.arccos(np.clip(cosine_angle, -1.0, 1.0)))
 
 def get_body_axis(kpts, l_idx, r_idx, min_conf=0.5, expected_y_below=None):
-    """
-    【オントロジー関数】
-    左右の関節データから、信頼できる「体の中心点」を推測する。
-    物理的にあり得ない点（expected_y_below）はYOLOが確信していても除外する。
-    """
+    """オントロジー制約（expected_y_below）に従って体の中心点を推測する"""
     valid_pts = []
     for idx in (l_idx, r_idx):
         pt = kpts[idx]
-        if pt[2] > min_conf: # 確信度が一定以上
-            # 物理制約：特定のY座標（例：腰）より下にあるべきパーツか？
+        if pt[2] > min_conf:
             if expected_y_below is None or pt[1] > expected_y_below:
                 valid_pts.append(pt[:2])
                 
     if len(valid_pts) == 2:
-        return (valid_pts[0] + valid_pts[1]) / 2 # 両方見えれば中点
+        return (valid_pts[0] + valid_pts[1]) / 2
     elif len(valid_pts) == 1:
-        return valid_pts[0] # 片方だけならそれを中心軸とみなす
-    return None # 両方見えない、または物理法則違反
+        return valid_pts[0]
+    return None
 
 def extract_jump_metrics(video_path, model):
     cap = cv2.VideoCapture(video_path)
     history = []
     
+    # --- 動画から「一番高い人」を全フレーム追跡 ---
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret: break
@@ -98,22 +122,27 @@ def extract_jump_metrics(video_path, model):
     if not history:
         return {}, None, None, None, None
 
-    # --- ① 真のAPEX（頂点） ---
+    # --- ① 真のAPEX（頂点）の特定 ---
     apex_idx = min(range(len(history)), key=lambda i: history[i]["hip_y"])
     apex_data = history[apex_idx]
     apex_frame, apex_kpts = apex_data["frame"], apex_data["kpts"]
     
-    # --- ② スナップダウン（下降） ---
+    # 知識ベース（JSON）からスナップダウン時の制約をロード
+    snap_ontology = knowledge["ontology"]["phases"]["SNAP_DOWN"]["constraints"]
+    ankle_margin = snap_ontology.get("ankle_must_be_below_hip_margin", 20)
+    knee_below_target = snap_ontology.get("knee_must_be_below")
+    
+    # --- ② スナップダウン（下降）の特定 ---
     snap_frame, snap_kpts = None, None
     for i in range(apex_idx + 1, len(history)):
         data = history[i]
         kpts = data["kpts"]
         
         c_hip = get_body_axis(kpts, 11, 12, min_conf=0.5)
-        c_ankle = get_body_axis(kpts, 15, 16, min_conf=0.4, expected_y_below=c_hip[1] if c_hip is not None else None)
         
-        # 足首が腰より下で確認できた瞬間をスナップダウンとする
-        if c_hip is not None and c_ankle is not None and c_ankle[1] > c_hip[1] + 20:
+        # 制約：足首は腰より[マージン]分下にあるべき
+        c_ankle = get_body_axis(kpts, 15, 16, min_conf=0.4)
+        if c_hip is not None and c_ankle is not None and c_ankle[1] > c_hip[1] + ankle_margin:
             snap_frame = data["frame"]
             snap_kpts = kpts
             break
@@ -122,22 +151,23 @@ def extract_jump_metrics(video_path, model):
         snap_frame = history[apex_idx + 5]["frame"]
         snap_kpts = history[apex_idx + 5]["kpts"]
 
-    # --- ③ 角度の計算（オントロジー適用） ---
+    # --- ③ 角度の計算（オントロジー制約の適用） ---
     metrics = {}
     if apex_kpts is not None and snap_kpts is not None:
         metrics["r_knee_angle"] = calculate_angle(apex_kpts[12][:2], apex_kpts[14][:2], apex_kpts[16][:2])
         metrics["l_knee_angle"] = calculate_angle(apex_kpts[11][:2], apex_kpts[13][:2], apex_kpts[15][:2])
         
-        # スナップダウンの腰角度は「体の中心軸」で計算する
         c_shoulder = get_body_axis(snap_kpts, 5, 6)
         c_hip = get_body_axis(snap_kpts, 11, 12)
-        # 膝は「絶対に腰より下にある」という制約をかける
-        c_knee = get_body_axis(snap_kpts, 13, 14, expected_y_below=c_hip[1] if c_hip is not None else None)
+        
+        # 制約：膝が腰(hip)より下にあるべきなら、それを条件にフィルター
+        knee_constraint_y = c_hip[1] if (knee_below_target == "hip" and c_hip is not None) else None
+        c_knee = get_body_axis(snap_kpts, 13, 14, expected_y_below=knee_constraint_y)
         
         if c_shoulder is not None and c_hip is not None and c_knee is not None:
             metrics["waist_flexion"] = calculate_angle(c_shoulder, c_hip, c_knee)
         else:
-            # ベースに完全に隠れるなどして推測不能な場合は、一直線(180度)とみなす
+            # 物理的制約に反してパーツが見えない場合は推測不能（一直線=180度）とする
             metrics["waist_flexion"] = 180.0 
         
     return metrics, apex_frame, apex_kpts, snap_frame, snap_kpts
@@ -156,21 +186,23 @@ def evaluate_metrics(metrics, rules):
         tags.append("PERFECT")
     return tags
 
-def draw_custom_keypoints(image, keypoints, phase_name):
+def draw_custom_keypoints(image, keypoints, phase_name, ontology_constraints=None):
+    """描画時にもオントロジー制約を適用してAIの幻覚（無駄な線）を描かない"""
     img_draw = image.copy()
     
-    # 描画時も「あり得ないノイズ」を描かないように軽くフィルタリング
     hip_y = (keypoints[11][1] + keypoints[12][1]) / 2 if (keypoints[11][2]>0.5 and keypoints[12][2]>0.5) else 0
     
     def is_valid_draw(idx, is_lower_body=False):
         if keypoints[idx][2] < 0.4: return False
-        if is_lower_body and hip_y > 0 and phase_name == "SNAP DOWN":
-            if keypoints[idx][1] < hip_y: return False # スナップダウン中に腰より上にある下半身は描かない
+        
+        # 知識ベースからの制約があれば適用
+        if is_lower_body and ontology_constraints and hip_y > 0:
+            if ontology_constraints.get("knee_must_be_below") == "hip":
+                if keypoints[idx][1] < hip_y: return False 
         return True
 
-    # 線の描画（有効な点だけ繋ぐ）
-    pts_r = [(int(keypoints[i][0]), int(keypoints[i][1])) for i in [6, 12, 14, 16] if is_valid_draw(i, i in [14, 16])]
-    pts_l = [(int(keypoints[i][0]), int(keypoints[i][1])) for i in [5, 11, 13, 15] if is_valid_draw(i, i in [13, 15])]
+    pts_r = [(int(keypoints[i][0]), int(keypoints[i][1])) for i in [6, 12, 14, 16] if is_valid_draw(i, i in [13, 14, 15, 16])]
+    pts_l = [(int(keypoints[i][0]), int(keypoints[i][1])) for i in [5, 11, 13, 15] if is_valid_draw(i, i in [13, 14, 15, 16])]
     
     for pts in [pts_r, pts_l]:
         for i in range(len(pts) - 1):
@@ -182,6 +214,9 @@ def draw_custom_keypoints(image, keypoints, phase_name):
     cv2.putText(img_draw, phase_name, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 3, cv2.LINE_AA)
     return img_draw
 
+# ==========================================
+# 4. Streamlit UI 構成
+# ==========================================
 st.set_page_config(page_title="チア トータッチ診断AI", layout="centered")
 st.title("📣 チア トータッチ診断 AI")
 
@@ -193,6 +228,11 @@ model = load_model()
 uploaded_file = st.file_uploader("動画をアップロード", type=["mp4", "mov", "avi"])
 
 if uploaded_file is not None:
+    # 新しい動画がアップロードされたらフィードバック状態をリセット
+    if "current_file" not in st.session_state or st.session_state.current_file != uploaded_file.name:
+        st.session_state.feedback_given = False
+        st.session_state.current_file = uploaded_file.name
+
     with st.spinner('ジャンプ全体を解析中...（数十秒かかります）'):
         tfile = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
         tfile.write(uploaded_file.read())
@@ -206,8 +246,10 @@ if uploaded_file is not None:
             else:
                 tags = evaluate_metrics(metrics, knowledge["rules"])
                 
+                # 描画時にもJSONのオントロジー制約を渡す
+                snap_constraints = knowledge["ontology"]["phases"]["SNAP_DOWN"]["constraints"]
                 img_apex = draw_custom_keypoints(apex_frame, apex_kpts, "APEX (Peak)")
-                img_snap = draw_custom_keypoints(snap_frame, snap_kpts, "SNAP DOWN")
+                img_snap = draw_custom_keypoints(snap_frame, snap_kpts, "SNAP DOWN", snap_constraints)
                 
                 st.success("一連のフォームを診断しました！")
                 
@@ -226,6 +268,36 @@ if uploaded_file is not None:
                 for tag in tags:
                     for item in knowledge["advices"].get(tag, []):
                         st.info(f"**{item['author']}より**: {item['advice']}")
+                
+                # --- フィードバック UI ---
+                st.markdown("---")
+                st.markdown("#### 📝 フィードバック")
+                
+                if not st.session_state.feedback_given:
+                    st.write("このアドバイスは役に立ちましたか？")
+                    col_fb1, col_fb2 = st.columns(2)
+                    
+                    with col_fb1:
+                        if st.button("👍 役に立った！", use_container_width=True):
+                            counts = load_feedback()
+                            counts["helpful"] += 1
+                            save_feedback(counts["helpful"], counts["not_helpful"])
+                            st.session_state.feedback_given = True
+                            st.rerun()
+                            
+                    with col_fb2:
+                        if st.button("👎 いまいち", use_container_width=True):
+                            counts = load_feedback()
+                            counts["not_helpful"] += 1
+                            save_feedback(counts["helpful"], counts["not_helpful"])
+                            st.session_state.feedback_given = True
+                            st.rerun()
+                
+                else:
+                    st.success("フィードバックありがとうございます！今後の精度向上に役立てます。")
+                    counts = load_feedback()
+                    st.write(f"📊 **現在の評価集計**: 👍 {counts['helpful']}件 / 👎 {counts['not_helpful']}件")
+
         finally:
             tfile.close()
             os.unlink(tfile.name)
