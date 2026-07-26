@@ -8,7 +8,7 @@ from ultralytics import YOLO
 
 # ==========================================
 # 1. 知識ベース（ルールとアドバイス）
-# ！！！ここは前回から一切変更していません！！！（アーキテクチャの勝利です）
+# ※ここは一切変更なし（アーキテクチャの完全分離）
 # ==========================================
 KNOWLEDGE_BASE_JSON = """
 {
@@ -36,15 +36,34 @@ KNOWLEDGE_BASE_JSON = """
 knowledge = json.loads(KNOWLEDGE_BASE_JSON)
 
 # ==========================================
-# 2. 処理機構（ロジック層）★ここを改良！
+# 2. 処理機構（ロジック層）★オントロジー（制約）を追加！
 # ==========================================
 def calculate_angle(a, b, c):
-    # (x, y, conf) のうち (x, y) だけを使って計算するように微調整
-    a, b, c = np.array(a[:2]), np.array(b[:2]), np.array(c[:2])
+    a, b, c = np.array(a), np.array(b), np.array(c)
     ba = a - b
     bc = c - b
     cosine_angle = np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc))
     return np.degrees(np.arccos(np.clip(cosine_angle, -1.0, 1.0)))
+
+def get_body_axis(kpts, l_idx, r_idx, min_conf=0.5, expected_y_below=None):
+    """
+    【オントロジー関数】
+    左右の関節データから、信頼できる「体の中心点」を推測する。
+    物理的にあり得ない点（expected_y_below）はYOLOが確信していても除外する。
+    """
+    valid_pts = []
+    for idx in (l_idx, r_idx):
+        pt = kpts[idx]
+        if pt[2] > min_conf: # 確信度が一定以上
+            # 物理制約：特定のY座標（例：腰）より下にあるべきパーツか？
+            if expected_y_below is None or pt[1] > expected_y_below:
+                valid_pts.append(pt[:2])
+                
+    if len(valid_pts) == 2:
+        return (valid_pts[0] + valid_pts[1]) / 2 # 両方見えれば中点
+    elif len(valid_pts) == 1:
+        return valid_pts[0] # 片方だけならそれを中心軸とみなす
+    return None # 両方見えない、または物理法則違反
 
 def extract_jump_metrics(video_path, model):
     cap = cv2.VideoCapture(video_path)
@@ -61,12 +80,10 @@ def extract_jump_metrics(video_path, model):
             best_kpts = None
             min_hip_y_in_frame = float('inf')
             
-            # .xy ではなく .data を使うことで、AIの「確信度(Confidence)」も取得
             for kpts in result.keypoints.data:
                 kpts_np = kpts.cpu().numpy()
                 l_hip, r_hip = kpts_np[11], kpts_np[12]
                 
-                # 【改良1】AIの確信度が低い（0.5未満）誤認ノイズは無視する
                 if l_hip[2] > 0.5 and r_hip[2] > 0.5:
                     hip_y = (l_hip[1] + r_hip[1]) / 2
                     if hip_y < min_hip_y_in_frame:
@@ -74,36 +91,29 @@ def extract_jump_metrics(video_path, model):
                         best_kpts = kpts_np
             
             if best_kpts is not None:
-                history.append({
-                    "frame": frame.copy(),
-                    "kpts": best_kpts,
-                    "hip_y": min_hip_y_in_frame
-                })
+                history.append({"frame": frame.copy(), "kpts": best_kpts, "hip_y": min_hip_y_in_frame})
                 
     cap.release()
     
     if not history:
         return {}, None, None, None, None
 
-    # --- ① 真のAPEX（頂点）を探す ---
+    # --- ① 真のAPEX（頂点） ---
     apex_idx = min(range(len(history)), key=lambda i: history[i]["hip_y"])
     apex_data = history[apex_idx]
     apex_frame, apex_kpts = apex_data["frame"], apex_data["kpts"]
     
-    # --- ② スナップダウン（下降）を探す ---
+    # --- ② スナップダウン（下降） ---
     snap_frame, snap_kpts = None, None
     for i in range(apex_idx + 1, len(history)):
         data = history[i]
         kpts = data["kpts"]
-        l_hip, r_hip = kpts[11], kpts[12]
-        l_ankle, r_ankle = kpts[15], kpts[16]
         
-        # 【改良2】左右の足首の距離と、左右の腰幅を計算
-        ankle_dist = np.linalg.norm(l_ankle[:2] - r_ankle[:2])
-        hip_width = np.linalg.norm(l_hip[:2] - r_hip[:2])
+        c_hip = get_body_axis(kpts, 11, 12, min_conf=0.5)
+        c_ankle = get_body_axis(kpts, 15, 16, min_conf=0.4, expected_y_below=c_hip[1] if c_hip is not None else None)
         
-        # 足首が腰より下にあり、かつ「足首の距離が腰幅の1.5倍以内に近づいた（＝脚が閉じた）」瞬間をスナップダウンとする
-        if l_ankle[1] > l_hip[1] and r_ankle[1] > r_hip[1] and ankle_dist < (hip_width * 1.5):
+        # 足首が腰より下で確認できた瞬間をスナップダウンとする
+        if c_hip is not None and c_ankle is not None and c_ankle[1] > c_hip[1] + 20:
             snap_frame = data["frame"]
             snap_kpts = kpts
             break
@@ -112,15 +122,23 @@ def extract_jump_metrics(video_path, model):
         snap_frame = history[apex_idx + 5]["frame"]
         snap_kpts = history[apex_idx + 5]["kpts"]
 
-    # --- ③ 角度の計算 ---
+    # --- ③ 角度の計算（オントロジー適用） ---
     metrics = {}
     if apex_kpts is not None and snap_kpts is not None:
-        metrics["r_knee_angle"] = calculate_angle(apex_kpts[12], apex_kpts[14], apex_kpts[16])
-        metrics["l_knee_angle"] = calculate_angle(apex_kpts[11], apex_kpts[13], apex_kpts[15])
+        metrics["r_knee_angle"] = calculate_angle(apex_kpts[12][:2], apex_kpts[14][:2], apex_kpts[16][:2])
+        metrics["l_knee_angle"] = calculate_angle(apex_kpts[11][:2], apex_kpts[13][:2], apex_kpts[15][:2])
         
-        r_waist = calculate_angle(snap_kpts[6], snap_kpts[12], snap_kpts[14])
-        l_waist = calculate_angle(snap_kpts[5], snap_kpts[11], snap_kpts[13])
-        metrics["waist_flexion"] = (r_waist + l_waist) / 2
+        # スナップダウンの腰角度は「体の中心軸」で計算する
+        c_shoulder = get_body_axis(snap_kpts, 5, 6)
+        c_hip = get_body_axis(snap_kpts, 11, 12)
+        # 膝は「絶対に腰より下にある」という制約をかける
+        c_knee = get_body_axis(snap_kpts, 13, 14, expected_y_below=c_hip[1] if c_hip is not None else None)
+        
+        if c_shoulder is not None and c_hip is not None and c_knee is not None:
+            metrics["waist_flexion"] = calculate_angle(c_shoulder, c_hip, c_knee)
+        else:
+            # ベースに完全に隠れるなどして推測不能な場合は、一直線(180度)とみなす
+            metrics["waist_flexion"] = 180.0 
         
     return metrics, apex_frame, apex_kpts, snap_frame, snap_kpts
 
@@ -140,30 +158,26 @@ def evaluate_metrics(metrics, rules):
 
 def draw_custom_keypoints(image, keypoints, phase_name):
     img_draw = image.copy()
-    targets = {
-        5: ("L-Shoulder", (255, 165, 0)), 6: ("R-Shoulder", (255, 165, 0)),
-        11: ("L-Hip", (0, 255, 255)), 12: ("R-Hip", (0, 255, 255)),
-        13: ("L-Knee", (0, 255, 0)), 14: ("R-Knee", (0, 255, 0)),
-        15: ("L-Ankle", (255, 0, 0)), 16: ("R-Ankle", (255, 0, 0))
-    }
     
-    for idx, (label, color) in targets.items():
-        x, y, conf = keypoints[idx][0], keypoints[idx][1], keypoints[idx][2]
-        # 確信度が極端に低い部位（0.3未満）は描画しない
-        if x != 0 and y != 0 and conf > 0.3:  
-            cv2.circle(img_draw, (int(x), int(y)), 6, color, -1)
-            
-    pts_r = [(int(keypoints[i][0]), int(keypoints[i][1])) for i in [6, 12, 14, 16] if keypoints[i][2] > 0.3]
-    pts_l = [(int(keypoints[i][0]), int(keypoints[i][1])) for i in [5, 11, 13, 15] if keypoints[i][2] > 0.3]
+    # 描画時も「あり得ないノイズ」を描かないように軽くフィルタリング
+    hip_y = (keypoints[11][1] + keypoints[12][1]) / 2 if (keypoints[11][2]>0.5 and keypoints[12][2]>0.5) else 0
     
-    if len(pts_r) == 4:
-        cv2.line(img_draw, pts_r[0], pts_r[1], (255, 255, 255), 2)
-        cv2.line(img_draw, pts_r[1], pts_r[2], (255, 255, 255), 2)
-        cv2.line(img_draw, pts_r[2], pts_r[3], (255, 255, 255), 2)
-    if len(pts_l) == 4:
-        cv2.line(img_draw, pts_l[0], pts_l[1], (255, 255, 255), 2)
-        cv2.line(img_draw, pts_l[1], pts_l[2], (255, 255, 255), 2)
-        cv2.line(img_draw, pts_l[2], pts_l[3], (255, 255, 255), 2)
+    def is_valid_draw(idx, is_lower_body=False):
+        if keypoints[idx][2] < 0.4: return False
+        if is_lower_body and hip_y > 0 and phase_name == "SNAP DOWN":
+            if keypoints[idx][1] < hip_y: return False # スナップダウン中に腰より上にある下半身は描かない
+        return True
+
+    # 線の描画（有効な点だけ繋ぐ）
+    pts_r = [(int(keypoints[i][0]), int(keypoints[i][1])) for i in [6, 12, 14, 16] if is_valid_draw(i, i in [14, 16])]
+    pts_l = [(int(keypoints[i][0]), int(keypoints[i][1])) for i in [5, 11, 13, 15] if is_valid_draw(i, i in [13, 15])]
+    
+    for pts in [pts_r, pts_l]:
+        for i in range(len(pts) - 1):
+            cv2.line(img_draw, pts[i], pts[i+1], (255, 255, 255), 2)
+            cv2.circle(img_draw, pts[i], 6, (0, 255, 255), -1)
+        if pts:
+            cv2.circle(img_draw, pts[-1], 6, (0, 255, 255), -1)
             
     cv2.putText(img_draw, phase_name, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 3, cv2.LINE_AA)
     return img_draw
