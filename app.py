@@ -22,18 +22,15 @@ from huggingface_hub import hf_hub_download
 def load_vitpose_model():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     
-    # Hugging Face 公式関数でサブフォルダ内の正しいパスから取得（キャッシュ対応）
+    # 1. Hugging Face からモデルファイルを確実に取得
     model_path = hf_hub_download(repo_id="JunkyByte/easy_ViTPose", filename="torch/coco/vitpose-s-coco.pth")
     yolo_path = hf_hub_download(repo_id="JunkyByte/easy_ViTPose", filename="yolov8/yolov8s.pt")
 
-    # ダウンロードしたローカルパスを渡してモデル初期化
-    model = VitInference(
-        model_path=model_path,
-        yolo_path=yolo_path,
-        model_name='s',
-        device=device
-    )
+    # 2. 引数名の相違を防ぐため、順番（位置引数）で指定して初期化
+    # 順番: (model_path, yolo_path, model_name, yolo_size, device)
+    model = VitInference(model_path, yolo_path, 's', 320, device)
     return model
+
 
 
 
