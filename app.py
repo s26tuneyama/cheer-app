@@ -17,17 +17,18 @@ st.write("Vision Transformer を使用し、空中トスや重なり（オクル
 # --------------------------------------------------
 @st.cache_resource
 def load_vitpose_model():
-    # クラウドの無料枠（GPUがない場合）でも動くよう自動判定
     device = "cuda" if torch.cuda.is_available() else "cpu"
     
-    # 軽量で精度が高い 's' (Small) モデルを使用
-    # （クラウドのメモリ制限対策）
+    # 必須パラメータであるモデル重みファイルの名称を追加
     model = VitInference(
+        model_path='vitpose-s-coco.pth',
+        yolo_path='yolov8s.pt',
         model_name='s', 
         yolo_name='yolov8s.pt', 
         device=device
     )
     return model
+
 
 # モデル読み込み
 with st.spinner("AIモデルを読み込んでいます..."):
