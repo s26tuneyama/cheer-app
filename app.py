@@ -5,222 +5,198 @@ import urllib.request
 import cv2
 from huggingface_hub import hf_hub_download
 import numpy as np
+import pandas as pd
 import streamlit as st
 import torch
 from easy_ViTPose import VitInference
 
+# COCO 17関節の接続関係 (骨格ラインを描く対)
+SKELETON_EDGES = [
+    (0, 1),
+    (0, 2),
+    (1, 3),
+    (2, 4),  # 顔
+    (5, 6),
+    (5, 7),
+    (7, 9),
+    (6, 8),
+    (8, 10),  # 腕
+    (5, 11),
+    (6, 12),  # 胴体
+    (11, 12),
+    (11, 13),
+    (13, 15),
+    (12, 14),
+    (14, 16),  # 脚
+]
+
 # --------------------------------------------------
-# アプリのタイトルと説明
+# アプリのタイトル
 # --------------------------------------------------
-st.title("🔍 骨格推定データ欠損デバッグアプリ (軽量版)")
+st.title("🤸‍♀️ 骨格自動補間 & 解析アプリ")
 st.write(
-    "1フレームごとに『データ不在（見失い）』か『低確信度（低Score）』かをメモリ負荷を抑えて計測します。"
+    "高速トスでAIが骨格を見失っても、前後のフレームから『途切れない骨格ライン』を全自動で推測・復元します。"
 )
 
 # --------------------------------------------------
 # サイドバー設定
 # --------------------------------------------------
-st.sidebar.title("⚙️ 解析パラメータ設定")
-
+st.sidebar.title("⚙️ 設定")
 conf_threshold = st.sidebar.slider(
-    "検出感度 (YOLO Confidence)",
-    min_value=0.10,
-    max_value=0.80,
-    value=0.20,
-    step=0.05,
-)
-
-yolo_size = st.sidebar.selectbox(
-    "YOLO入力サイズ (解像度)",
-    options=[320, 640],
-    index=1,
-)
-
-use_tracking = st.sidebar.checkbox(
-    "動画トラッキング (ByteTrack) を有効化", value=False
+    "関節採用の最小確信度", 0.05, 0.50, 0.15, 0.05
 )
 
 
 # --------------------------------------------------
-# ViTPoseモデルのロード（YOLO Medium版：省メモリ設定）
+# モデルのロード (軽量かつ高精度な Medium 版)
 # --------------------------------------------------
 @st.cache_resource
-def load_vitpose_model(yolo_size_val: int, is_video_val: bool):
+def load_vitpose_model():
   device = "cuda" if torch.cuda.is_available() else "cpu"
-
   model_file = hf_hub_download(
       repo_id="JunkyByte/easy_ViTPose", filename="torch/coco/vitpose-s-coco.pth"
   )
-
-  # メモリ節約のため yolov8m (Medium) を使用
   yolo_file = "yolov8m.pt"
   if not os.path.exists(yolo_file):
     url = "https://github.com/ultralytics/assets/releases/download/v8.2.0/yolov8m.pt"
-    with st.spinner("🧠 省メモリ型AIモデル (YOLOv8-Medium) を準備中..."):
-      urllib.request.urlretrieve(url, yolo_file)
+    urllib.request.urlretrieve(url, yolo_file)
 
   model = VitInference(
       model=model_file,
       yolo=yolo_file,
       model_name="s",
       dataset="coco",
-      yolo_size=yolo_size_val,
-      is_video=is_video_val,
+      yolo_size=640,
+      is_video=False,
       device=device,
   )
   return model
 
 
-with st.spinner("AIモデルを読み込み中..."):
-  model = load_vitpose_model(yolo_size, use_tracking)
+with st.spinner("AIモデル準備中..."):
+  model = load_vitpose_model()
 
-try:
-  model.yolo.conf = conf_threshold
-except AttributeError:
-  pass
 
 # --------------------------------------------------
-# 動画アップロード & デバッグ解析処理
+# 補間後の骨格を綺麗に動画へ上書き描画する関数
 # --------------------------------------------------
-st.subheader("📁 メディアのアップロード")
+def draw_interpolated_skeleton(frame, kpts_17x2):
+  """補間された座標 (17, 2) を動画フレームに描画"""
+  # 関節点（円）の描画
+  for i, (x, y) in enumerate(kpts_17x2):
+    if not np.isnan(x) and not np.isnan(y):
+      cv2.circle(frame, (int(x), int(y)), 5, (0, 255, 0), -1)
+
+  # 骨格線（ライン）の描画
+  for p1_idx, p2_idx in SKELETON_EDGES:
+    x1, y1 = kpts_17x2[p1_idx]
+    x2, y2 = kpts_17x2[p2_idx]
+
+    if (
+        not np.isnan(x1)
+        and not np.isnan(y1)
+        and not np.isnan(x2)
+        and not np.isnan(y2)
+    ):
+      cv2.line(
+          frame,
+          (int(x1), int(y1)),
+          (int(x2), int(y2)),
+          (0, 255, 255),
+          2,
+      )
+
+  return frame
+
+
+# --------------------------------------------------
+# 動画の処理メインルーチン
+# --------------------------------------------------
 uploaded_file = st.file_uploader(
-    "デバッグしたい動画を選択してください", type=["mp4", "mov", "avi"]
+    "解析したい動画を選択してください", type=["mp4", "mov", "avi"]
 )
 
 if uploaded_file is not None:
   st.video(uploaded_file)
 
-  if st.button("🚨 デバッグ解析を開始"):
+  if st.button("🚀 欠損補間 & 骨格解析を実行"):
     tfile = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
     tfile.write(uploaded_file.read())
 
+    # --- Pass 1: 全フレームの骨格座標を抽出 ---
     cap = cv2.VideoCapture(tfile.name)
-
-    # レイアウトの構築
-    col1, col2 = st.columns([3, 2])
-    with col1:
-      st_frame = st.empty()
-    with col2:
-      st.markdown("### 📊 デバッグ状態")
-      st_status = st.empty()
-      st_metrics = st.empty()
-
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    st.info("ステップ 1/2: 動画から骨格座標データを抽出中...")
     progress_bar = st.progress(0)
 
-    missing_frames = 0
-    frame_count = 0
+    raw_data = []  # 各フレームの座標保持用リスト
+    frame_list = []
 
+    frame_idx = 0
     while cap.isOpened():
       ret, frame = cap.read()
       if not ret:
         break
 
+      frame_list.append(frame)
       pts = model.inference(frame)
-      raw_out_frame = model.draw()
 
-      if raw_out_frame is None:
-        out_frame = frame.copy()
-      else:
-        out_frame = np.ascontiguousarray(raw_out_frame, dtype=np.uint8)
+      # 17関節分 (x, y) の初期値を NaN（未検出）でセット
+      frame_kpts = np.full((17, 2), np.nan)
 
-      frame_count += 1
-      is_missing = len(pts) == 0
+      if len(pts) > 0:
+        # 先頭の人物データ（フライヤー）を取得
+        kpts_data = list(pts.values())[0]
+        if isinstance(kpts_data, dict) and "keypoints" in kpts_data:
+          kpts = np.array(kpts_data["keypoints"])
+        else:
+          kpts = np.array(kpts_data)
 
-      if is_missing:
-        missing_frames += 1
-        st_status.error(
-            f"❌ **Frame {frame_count}**: 人物未検出 (データ空っぽ)"
-        )
+        if kpts.ndim == 2:
+          for j in range(min(17, len(kpts))):
+            conf = kpts[j, 2] if kpts.shape[1] >= 3 else 1.0
+            if conf >= conf_threshold:
+              frame_kpts[j] = [kpts[j, 0], kpts[j, 1]]
 
-        cv2.putText(
-            out_frame,
-            "MISSING (No Detection)",
-            (30, 50),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            1.0,
-            (0, 0, 255),
-            3,
-        )
-      else:
-        st_status.success(
-            f"✅ **Frame {frame_count}**: 人物検出完了 ({len(pts)}人)"
-        )
+      raw_data.append(frame_kpts.flatten())  # 17x2 = 34次元
 
-        try:
-          kpts_data = list(pts.values())[0]
-          if (
-              isinstance(kpts_data, dict)
-              and "keypoints" in kpts_data
-          ):
-            kpts = np.array(kpts_data["keypoints"])
-          else:
-            kpts = np.array(kpts_data)
+      frame_idx += 1
+      if total_frames > 0:
+        progress_bar.progress(min(frame_idx / total_frames, 0.5))
 
-          if kpts.ndim == 2 and kpts.shape[1] >= 3:
-            confs = kpts[:, 2]
-          else:
-            confs = np.ones(17)
-        except Exception:
-          confs = np.ones(17)
+    cap.release()
 
-        avg_conf = float(np.mean(confs))
-        min_conf = float(np.min(confs))
+    # --- ステップ 2: 前後フレームからの補間（Interpolation） ---
+    st.info("ステップ 2/2: 見失ったフレームの骨格を全自動補間中...")
 
-        cv2.putText(
-            out_frame,
-            f"Avg Conf: {avg_conf:.2f}",
-            (30, 50),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            1.0,
-            (0, 255, 0),
-            2,
-        )
+    # 34列（17関節×XY座標）のDataFrameに変換
+    df_coords = pd.DataFrame(raw_data)
 
-        st_metrics.metric(
-            label="現在のキーポイント平均確信度",
-            value=f"{avg_conf * 100:.1f}%",
-            delta=f"最低関節: {min_conf * 100:.1f}%",
-        )
+    # ★核心部分: 線形補間（前後データから欠損コマを自動計算）
+    df_interpolated = df_coords.interpolate(
+        method="linear", limit_direction="both"
+    )
+
+    # --- ステップ 3: 補正された骨格で動画をレンダリング表示 ---
+    st_frame = st.empty()
+
+    for idx, frame in enumerate(frame_list):
+      kpts_smoothed = df_interpolated.iloc[idx].values.reshape(17, 2)
+
+      # 補正済みのラインを描画
+      out_frame = draw_interpolated_skeleton(frame.copy(), kpts_smoothed)
 
       out_frame_rgb = cv2.cvtColor(out_frame, cv2.COLOR_BGR2RGB)
       st_frame.image(out_frame_rgb, channels="RGB", use_container_width=True)
 
       if total_frames > 0:
-        progress_bar.progress(min(frame_count / total_frames, 1.0))
+        progress_bar.progress(min(0.5 + (idx / total_frames) * 0.5, 1.0))
 
-      # メモリ解放処理
-      del raw_out_frame, out_frame, out_frame_rgb, pts
-      if frame_count % 10 == 0:
-        gc.collect()
-
-    cap.release()
-
-    # --------------------------------------------------
-    # 最終分析サマリーレポート
-    # --------------------------------------------------
-    st.markdown("---")
-    st.subheader("📋 デバッグ分析結果サマリー")
-
-    missing_rate = (
-        (missing_frames / frame_count * 100) if frame_count > 0 else 0
+    st.success(
+        "🎉 骨格の欠損補間と追従描画が完了しました！連続した綺麗な骨格データが保持されています。"
     )
 
-    col_a, col_b, col_c = st.columns(3)
-    col_a.metric("総フレーム数", f"{frame_count} frames")
-    col_b.metric("データ消失（未検出）コマ数", f"{missing_frames} frames")
-    col_c.metric("データ消失率", f"{missing_rate:.1f}%")
-
-    if missing_rate > 15:
-      st.warning(
-          "⚠️ **主な原因: 人物検出（YOLO）の途切れ**\n"
-          f"全体の {missing_rate:.1f}% のコマでAIが人を完全に見失っています。"
-          "前後のデータ補間（Interpolation）が有効です。"
-      )
-    else:
-      st.info(
-          "💡 **主な原因: 関節確信度（Confidence）の低下**\n"
-          "人物自体は見失っていませんが、関節の確信度が低いため描画ルールにより消えています。"
-          "補間処理でキレイに接続可能です。"
-      )
+    del frame_list, raw_data, df_coords, df_interpolated
+    gc.collect()
 
