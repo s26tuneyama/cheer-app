@@ -4,6 +4,7 @@ import tempfile
 import os
 import torch
 from easy_ViTPose import VitInference
+import urllib.request
 
 # --------------------------------------------------
 # ページ設定
@@ -19,15 +20,24 @@ st.write("Vision Transformer を使用し、空中トスや重なり（オクル
 def load_vitpose_model():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     
-    # 必須パラメータであるモデル重みファイルの名称を追加
+    # 1. ViTPoseの重みファイルが無い場合は自動でダウンロード
+    model_path = 'vitpose-s-coco.pth'
+    if not os.path.exists(model_path):
+        url = "https://huggingface.co/JunkyByte/easy_ViTPose/resolve/main/vitpose-s-coco.pth"
+        urllib.request.urlretrieve(url, model_path)
+    
+    yolo_path = 'yolov8s.pt'
+
+    # 2. 正しい引数でモデルを初期化
     model = VitInference(
-        model_path='vitpose-s-coco.pth',
-        yolo_path='yolov8s.pt',
-        model_name='s', 
-        yolo_name='yolov8s.pt', 
+        model_path=model_path,
+        yolo_path=yolo_path,
+        model_name='s',
         device=device
     )
     return model
+
+
 
 
 # モデル読み込み
