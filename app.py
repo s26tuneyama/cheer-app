@@ -13,6 +13,8 @@ st.set_page_config(page_title="チア動画姿勢推定 (ViTPose)", layout="wide
 st.title("🤸‍♀️ チアリーディング骨格検出アプリ (ViTPose版)")
 st.write("Vision Transformer を使用し、空中トスや重なり（オクルージョン）に強い姿勢推定を行います。")
 
+from huggingface_hub import hf_hub_download
+
 # --------------------------------------------------
 # ViTPoseモデルのロード（キャッシュして高速化）
 # --------------------------------------------------
@@ -20,15 +22,11 @@ st.write("Vision Transformer を使用し、空中トスや重なり（オクル
 def load_vitpose_model():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     
-    # 1. ViTPoseの重みファイルが無い場合は自動でダウンロード
-    model_path = 'vitpose-s-coco.pth'
-    if not os.path.exists(model_path):
-        url = "https://huggingface.co/JunkyByte/easy_ViTPose/resolve/main/vitpose-s-coco.pth"
-        urllib.request.urlretrieve(url, model_path)
-    
-    yolo_path = 'yolov8s.pt'
+    # Hugging Face 公式関数でサブフォルダ内の正しいパスから取得（キャッシュ対応）
+    model_path = hf_hub_download(repo_id="JunkyByte/easy_ViTPose", filename="torch/coco/vitpose-s-coco.pth")
+    yolo_path = hf_hub_download(repo_id="JunkyByte/easy_ViTPose", filename="yolov8/yolov8s.pt")
 
-    # 2. 正しい引数でモデルを初期化
+    # ダウンロードしたローカルパスを渡してモデル初期化
     model = VitInference(
         model_path=model_path,
         yolo_path=yolo_path,
@@ -36,6 +34,8 @@ def load_vitpose_model():
         device=device
     )
     return model
+
+
 
 
 
