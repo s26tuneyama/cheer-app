@@ -1,41 +1,20 @@
+import gc
 import os
 import tempfile
 import urllib.request
 import cv2
 from huggingface_hub import hf_hub_download
 import numpy as np
-import pandas as pd
 import streamlit as st
 import torch
 from easy_ViTPose import VitInference
 
-# COCO 17キーポイントの名称リスト
-KEYPOINT_NAMES = [
-    "Nose",
-    "L_Eye",
-    "R_Eye",
-    "L_Ear",
-    "R_Ear",
-    "L_Shoulder",
-    "R_Shoulder",
-    "L_Elbow",
-    "R_Elbow",
-    "L_Wrist",
-    "R_Wrist",
-    "L_Hip",
-    "R_Hip",
-    "L_Knee",
-    "R_Knee",
-    "L_Ankle",
-    "R_Ankle",
-]
-
 # --------------------------------------------------
 # アプリのタイトルと説明
 # --------------------------------------------------
-st.title("🔍 骨格推定データ欠損デバッグアプリ")
+st.title("🔍 骨格推定データ欠損デバッグアプリ (軽量版)")
 st.write(
-    "1フレームごとに『データ不在（見失い）』か『低確信度（低Score）』かをリアルタイムで計測・ログ出力します。"
+    "1フレームごとに『データ不在（見失い）』か『低確信度（低Score）』かをメモリ負荷を抑えて計測します。"
 )
 
 # --------------------------------------------------
@@ -52,7 +31,9 @@ conf_threshold = st.sidebar.slider(
 )
 
 yolo_size = st.sidebar.selectbox(
-    "YOLO入力サイズ (解像度)", options=[320, 640], index=1
+    "YOLO入力サイズ (解像度)",
+    options=[320, 640],
+    index=1,
 )
 
 use_tracking = st.sidebar.checkbox(
@@ -61,7 +42,7 @@ use_tracking = st.sidebar.checkbox(
 
 
 # --------------------------------------------------
-# ViTPoseモデルのロード（YOLO Large版）
+# ViTPoseモデルのロード（YOLO Medium版：省メモリ設定）
 # --------------------------------------------------
 @st.cache_resource
 def load_vitpose_model(yolo_size_val: int, is_video_val: bool):
@@ -71,10 +52,11 @@ def load_vitpose_model(yolo_size_val: int, is_video_val: bool):
       repo_id="JunkyByte/easy_ViTPose", filename="torch/coco/vitpose-s-coco.pth"
   )
 
-  yolo_file = "yolov8l.pt"
+  # メモリ節約のため yolov8m (Medium) を使用
+  yolo_file = "yolov8m.pt"
   if not os.path.exists(yolo_file):
-    url = "https://github.com/ultralytics/assets/releases/download/v8.2.0/yolov8l.pt"
-    with st.spinner("🧠 大型AIモデル (YOLOv8-Large) を初回ダウンロード中..."):
+    url = "https://github.com/ultralytics/assets/releases/download/v8.2.0/yolov8m.pt"
+    with st.spinner("🧠 省メモリ型AIモデル (YOLOv8-Medium) を準備中..."):
       urllib.request.urlretrieve(url, yolo_file)
 
   model = VitInference(
@@ -119,16 +101,13 @@ if uploaded_file is not None:
     with col1:
       st_frame = st.empty()
     with col2:
-      st.markdown("### 📊 リアルタイム・デバッグログ")
+      st.markdown("### 📊 デバッグ状態")
       st_status = st.empty()
       st_metrics = st.empty()
-      st_kpt_table = st.empty()
 
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     progress_bar = st.progress(0)
 
-    # 統計用データ格納
-    frame_logs = []
     missing_frames = 0
     frame_count = 0
 
@@ -140,7 +119,6 @@ if uploaded_file is not None:
       pts = model.inference(frame)
       raw_out_frame = model.draw()
 
-      # OpenCV描画用への安全な変換(安全フィルター)
       if raw_out_frame is None:
         out_frame = frame.copy()
       else:
@@ -164,13 +142,6 @@ if uploaded_file is not None:
             (0, 0, 255),
             3,
         )
-
-        frame_logs.append({
-            "frame": frame_count,
-            "detected": False,
-            "avg_conf": 0.0,
-            "min_conf": 0.0,
-        })
       else:
         st_status.success(
             f"✅ **Frame {frame_count}**: 人物検出完了 ({len(pts)}人)"
@@ -212,28 +183,16 @@ if uploaded_file is not None:
             delta=f"最低関節: {min_conf * 100:.1f}%",
         )
 
-        df_kpts = pd.DataFrame(
-            {"関節名": KEYPOINT_NAMES, "確信度 (%)": (confs * 100).round(1)}
-        )
-        st_kpt_table.dataframe(
-            df_kpts.style.highlight_between(
-                left=0, right=30, color="#ffcdd2"
-            ),
-            height=250,
-        )
-
-        frame_logs.append({
-            "frame": frame_count,
-            "detected": True,
-            "avg_conf": avg_conf,
-            "min_conf": min_conf,
-        })
-
       out_frame_rgb = cv2.cvtColor(out_frame, cv2.COLOR_BGR2RGB)
       st_frame.image(out_frame_rgb, channels="RGB", use_container_width=True)
 
       if total_frames > 0:
         progress_bar.progress(min(frame_count / total_frames, 1.0))
+
+      # メモリ解放処理
+      del raw_out_frame, out_frame, out_frame_rgb, pts
+      if frame_count % 10 == 0:
+        gc.collect()
 
     cap.release()
 
@@ -256,12 +215,12 @@ if uploaded_file is not None:
       st.warning(
           "⚠️ **主な原因: 人物検出（YOLO）の途切れ**\n"
           f"全体の {missing_rate:.1f}% のコマでAIが人を完全に見失っています。"
-          "YOLOの閾値を下げるか、前後のデータ補間（Interpolation）が必要です。"
+          "前後のデータ補間（Interpolation）が有効です。"
       )
     else:
       st.info(
           "💡 **主な原因: 関節確信度（Confidence）の低下**\n"
-          "人物自体は見失っていませんが、特定の関節の確信度が低いため描画ルールにより画面上で消えています。"
-          "描画閾値の解除、または欠損キーポイントの補間処理でキレイに接続可能です。"
+          "人物自体は見失っていませんが、関節の確信度が低いため描画ルールにより消えています。"
+          "補間処理でキレイに接続可能です。"
       )
 
