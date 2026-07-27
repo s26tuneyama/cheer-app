@@ -1,7 +1,8 @@
 streamlit
-opencv-python-headless
 torch
 torchvision
 ultralytics
+scikit-image
+filterpy
+lapx
 git+https://github.com/JunkyByte/easy_ViTPose.git
-
