@@ -13,6 +13,7 @@ st.set_page_config(page_title="チア動画姿勢推定 (ViTPose)", layout="wide
 st.title("🤸‍♀️ チアリーディング骨格検出アプリ (ViTPose版)")
 st.write("Vision Transformer を使用し、空中トスや重なり（オクルージョン）に強い姿勢推定を行います。")
 
+
 from huggingface_hub import hf_hub_download
 
 # --------------------------------------------------
@@ -26,17 +27,19 @@ def load_vitpose_model():
     model_path = hf_hub_download(repo_id="JunkyByte/easy_ViTPose", filename="torch/coco/vitpose-s-coco.pth")
     yolo_path = hf_hub_download(repo_id="JunkyByte/easy_ViTPose", filename="yolov8/yolov8s.pt")
 
-    # 2. 数値の 0 (人物ID) を指定してモデルを正しく初期化
+    # 2. 正しいパラメータのみ・文字列 'human' を渡して初期化
     model = VitInference(
         model_path=model_path,
         yolo_path=yolo_path,
         model_name='s',
         yolo_size=320,
         dataset='coco',
-        det_class=0,  # 数値の 0 (COCO/YOLOの人物クラスID)
+        det_class='human',
         device=device
     )
     return model
+
+
 
 
 # モデル読み込み
