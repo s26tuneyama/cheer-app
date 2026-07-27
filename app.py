@@ -14,30 +14,40 @@ st.title("🤸‍♀️ チアリーディング骨格検出アプリ (ViTPose�
 st.write("Vision Transformer を使用し、空中トスや重なり（オクルージョン）に強い姿勢推定を行います。")
 
 
+
 from huggingface_hub import hf_hub_download
+import streamlit as st
+import torch
+from easy_ViTPose import VitInference
+
 
 # --------------------------------------------------
 # ViTPoseモデルのロード（キャッシュして高速化）
 # --------------------------------------------------
 @st.cache_resource
 def load_vitpose_model():
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    
-    # 1. Hugging Face からモデルファイルを確実に取得
-    model_path = hf_hub_download(repo_id="JunkyByte/easy_ViTPose", filename="torch/coco/vitpose-s-coco.pth")
-    yolo_path = hf_hub_download(repo_id="JunkyByte/easy_ViTPose", filename="yolov8/yolov8s.pt")
+  device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # 2. 正しいパラメータのみ・文字列 'human' を渡して初期化
-    model = VitInference(
-        model_path=model_path,
-        yolo_path=yolo_path,
-        model_name='s',
-        yolo_size=320,
-        dataset='coco',
-        det_class='human',
-        device=device
-    )
-    return model
+  # 1. Hugging Face からモデルファイルを確実に取得
+  model_path = hf_hub_download(
+      repo_id="JunkyByte/easy_ViTPose", filename="torch/coco/vitpose-s-coco.pth"
+  )
+  yolo_path = hf_hub_download(
+      repo_id="JunkyByte/easy_ViTPose", filename="yolov8/yolov8s.pt"
+  )
+
+  # 2. easy_ViTPose 公式の正当な引数のみで初期化
+  model = VitInference(
+      model_path=model_path,
+      yolo_path=yolo_path,
+      model_name="s",
+      yolo_size=320,
+      dataset="coco",
+      is_video=False,
+      device=device,
+  )
+  return model
+
 
 
 
