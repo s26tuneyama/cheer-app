@@ -138,7 +138,13 @@ if uploaded_file is not None:
         break
 
       pts = model.inference(frame)
-      out_frame = model.draw()
+      raw_out_frame = model.draw()
+
+      # OpenCV描画用への安全な変換(安全フィルター)
+      if raw_out_frame is None:
+        out_frame = frame.copy()
+      else:
+        out_frame = np.ascontiguousarray(raw_out_frame, dtype=np.uint8)
 
       frame_count += 1
       is_missing = len(pts) == 0
@@ -149,7 +155,6 @@ if uploaded_file is not None:
             f"❌ **Frame {frame_count}**: 人物未検出 (データ空っぽ)"
         )
 
-        # 画面にエラー文字を描画
         cv2.putText(
             out_frame,
             "MISSING (No Detection)",
@@ -171,19 +176,26 @@ if uploaded_file is not None:
             f"✅ **Frame {frame_count}**: 人物検出完了 ({len(pts)}人)"
         )
 
-        # 先頭の人物（フライヤー想定）の確信度を抽出
-        kpts = list(pts.values())[0]  # shape: (17, 3) など
+        try:
+          kpts_data = list(pts.values())[0]
+          if (
+              isinstance(kpts_data, dict)
+              and "keypoints" in kpts_data
+          ):
+            kpts = np.array(kpts_data["keypoints"])
+          else:
+            kpts = np.array(kpts_data)
 
-        # 確信度カラムの取得 (3列目があればそれがconfidence)
-        if kpts.shape[1] >= 3:
-          confs = kpts[:, 2]
-        else:
-          confs = np.ones(17)  # 確信度情報がない場合のフォールバック
+          if kpts.ndim == 2 and kpts.shape[1] >= 3:
+            confs = kpts[:, 2]
+          else:
+            confs = np.ones(17)
+        except Exception:
+          confs = np.ones(17)
 
         avg_conf = float(np.mean(confs))
         min_conf = float(np.min(confs))
 
-        # 画面に平均確信度を描画
         cv2.putText(
             out_frame,
             f"Avg Conf: {avg_conf:.2f}",
@@ -194,18 +206,21 @@ if uploaded_file is not None:
             2,
         )
 
-        # メトリクス表示
         st_metrics.metric(
             label="現在のキーポイント平均確信度",
             value=f"{avg_conf * 100:.1f}%",
             delta=f"最低関節: {min_conf * 100:.1f}%",
         )
 
-        # 各関節の確信度テーブル作成
         df_kpts = pd.DataFrame(
             {"関節名": KEYPOINT_NAMES, "確信度 (%)": (confs * 100).round(1)}
         )
-        st_kpt_table.dataframe(df_kpts.style.highlight_between(left=0, right=30, color="#ffcdd2"), height=250)
+        st_kpt_table.dataframe(
+            df_kpts.style.highlight_between(
+                left=0, right=30, color="#ffcdd2"
+            ),
+            height=250,
+        )
 
         frame_logs.append({
             "frame": frame_count,
@@ -214,7 +229,6 @@ if uploaded_file is not None:
             "min_conf": min_conf,
         })
 
-      # 映像更新
       out_frame_rgb = cv2.cvtColor(out_frame, cv2.COLOR_BGR2RGB)
       st_frame.image(out_frame_rgb, channels="RGB", use_container_width=True)
 
