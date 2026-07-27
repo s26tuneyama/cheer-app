@@ -2,4 +2,6 @@ streamlit
 opencv-python-headless
 torch
 torchvision
+ultralytics
 git+https://github.com/JunkyByte/easy_ViTPose.git
+
