@@ -30,12 +30,88 @@ SKELETON_EDGES = [
     (14, 16),  # 脚
 ]
 
+# IDごとの識別用カラーパレット (BGR)
+COLOR_PALETTE = [
+    (255, 51, 51),  # 赤/青系
+    (51, 255, 51),  # 黄緑
+    (51, 51, 255),  # 青
+    (255, 255, 51),  # 黄
+    (255, 51, 255),  # マゼンタ
+    (51, 255, 255),  # シアン
+    (255, 153, 51),  # オレンジ
+    (153, 51, 255),  # 紫
+    (51, 255, 153),  # エメラルド
+    (255, 102, 178),  # ピンク
+]
+
+
+def get_id_color(track_id: int):
+  """ID番号に応じた固有の色を取得"""
+  idx = int(track_id) % len(COLOR_PALETTE)
+  return COLOR_PALETTE[idx]
+
+
+def draw_person_skeleton(frame, kpts, track_id, conf_thresh=0.15):
+  """個別の人物骨格とIDラベルを描画"""
+  color = get_id_color(track_id)
+
+  # 関節（点）の描画
+  for pt in kpts:
+    x, y = pt[0], pt[1]
+    conf = pt[2] if len(pt) >= 3 else 1.0
+    if conf >= conf_thresh and not np.isnan(x) and not np.isnan(y):
+      cv2.circle(frame, (int(x), int(y)), 4, color, -1)
+
+  # 骨格（線）の描画
+  for p1, p2 in SKELETON_EDGES:
+    pt1, pt2 = kpts[p1], kpts[p2]
+    c1 = pt1[2] if len(pt1) >= 3 else 1.0
+    c2 = pt2[2] if len(pt2) >= 3 else 1.0
+    if c1 >= conf_thresh and c2 >= conf_thresh:
+      if not (
+          np.isnan(pt1[0])
+          or np.isnan(pt1[1])
+          or np.isnan(pt2[0])
+          or np.isnan(pt2[1])
+      ):
+        cv2.line(
+            frame,
+            (int(pt1[0]), int(pt1[1])),
+            (int(pt2[0]), int(pt2[1])),
+            color,
+            2,
+        )
+
+  # 頭上に ID ラベルを描画
+  valid_y = [
+      pt[1] for pt in kpts if (len(pt) < 3 or pt[2] >= conf_thresh)
+  ]
+  valid_x = [
+      pt[0] for pt in kpts if (len(pt) < 3 or pt[2] >= conf_thresh)
+  ]
+  if valid_y and valid_x:
+    top_x = int(np.mean(valid_x))
+    top_y = int(min(valid_y)) - 15
+    cv2.putText(
+        frame,
+        f"ID: {track_id}",
+        (max(10, top_x - 20), max(20, top_y)),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.6,
+        color,
+        2,
+    )
+
+  return frame
+
+
 # --------------------------------------------------
-# タイトルと説明
+# アプリのタイトルと説明
 # --------------------------------------------------
-st.title("🤸‍♀️ フライヤー見た目追跡 (ReID) 骨格解析アプリ")
+st.title("🤸‍♀️ チーム全員マルチIDトラッキング骨格解析アプリ")
 st.write(
-    "地上での密着時にIDが入れ替わっても、ユニフォームの『見た目（色特徴）』でフライヤーを自動識別・ロックオンします。"
+    "全員の骨格を同時に検知し、IDごとに色分けして自動追跡。"
+    "グループ全体の連携や交差時の挙動を幅広く分析できます。"
 )
 
 # --------------------------------------------------
@@ -55,77 +131,14 @@ yolo_size = st.sidebar.selectbox(
     "YOLO入力サイズ (解像度)", options=[320, 640], index=1
 )
 
-color_similarity_thresh = st.sidebar.slider(
-    "見た目類似度しきい値",
-    min_value=0.10,
-    max_value=0.80,
-    value=0.30,
-    step=0.05,
-    help="地上で重なった際、衣装の色がこの値以上一致する人をフライヤーとみなします。",
-)
-
 
 # --------------------------------------------------
-# 見た目（ReID）用特徴量抽出関数
-# --------------------------------------------------
-def extract_color_histogram(frame, kpts):
-  """キーポイントから人物領域を切り出し、HSVカラーヒストグラム（見た目特徴）を計算"""
-  valid_pts = kpts[kpts[:, 2] > 0.1] if kpts.shape[1] >= 3 else kpts
-  if len(valid_pts) < 3:
-    return None
-
-  x1, y1 = np.min(valid_pts[:, 0]), np.min(valid_pts[:, 1])
-  x2, y2 = np.max(valid_pts[:, 0]), np.max(valid_pts[:, 1])
-
-  h, w, _ = frame.shape
-  x1, y1 = max(0, int(x1)), max(0, int(y1))
-  x2, y2 = min(w, int(x2)), min(h, int(y2))
-
-  if x2 <= x1 or y2 <= y1:
-    return None
-
-  crop = frame[y1:y2, x1:x2]
-  hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-
-  # H(色相)とS(彩度)のヒストグラムを抽出
-  hist = cv2.calcHist([hsv], [0, 1], None, [18, 25], [0, 180, 0, 256])
-  cv2.normalize(hist, hist, 0, 1, cv2.NORM_MINMAX)
-  return hist
-
-
-def compare_histograms(hist1, hist2):
-  """2つの見た目特徴量の相関度 (0.0 ~ 1.0) を算出"""
-  if hist1 is None or hist2 is None:
-    return 0.0
-  return float(cv2.compareHist(hist1, hist2, cv2.HISTCMP_CORREL))
-
-
-def draw_skeleton(frame, kpts_17x3):
-  """特定された人物の骨格を描画"""
-  for x, y, conf in kpts_17x3:
-    if conf >= 0.15:
-      cv2.circle(frame, (int(x), int(y)), 5, (0, 255, 0), -1)
-
-  for p1_idx, p2_idx in SKELETON_EDGES:
-    x1, y1, c1 = kpts_17x3[p1_idx]
-    x2, y2, c2 = kpts_17x3[p2_idx]
-    if c1 >= 0.15 and c2 >= 0.15:
-      cv2.line(
-          frame,
-          (int(x1), int(y1)),
-          (int(x2), int(y2)),
-          (0, 255, 255),
-          2,
-      )
-  return frame
-
-
-# --------------------------------------------------
-# モデルのロード (YOLO Large)
+# ViTPoseモデルのロード（YOLO Large + 動画トラッキング有効）
 # --------------------------------------------------
 @st.cache_resource
 def load_vitpose_model(yolo_size_val: int):
   device = "cuda" if torch.cuda.is_available() else "cpu"
+
   model_file = hf_hub_download(
       repo_id="JunkyByte/easy_ViTPose", filename="torch/coco/vitpose-s-coco.pth"
   )
@@ -142,7 +155,7 @@ def load_vitpose_model(yolo_size_val: int):
       model_name="s",
       dataset="coco",
       yolo_size=yolo_size_val,
-      is_video=False,
+      is_video=True,  # ByteTrack有効化
       device=device,
   )
   return model
@@ -157,7 +170,7 @@ except AttributeError:
   pass
 
 # --------------------------------------------------
-# 動画解析処理
+# 動画アップロード & 解析処理
 # --------------------------------------------------
 st.subheader("📁 メディアのアップロード")
 uploaded_file = st.file_uploader(
@@ -167,7 +180,7 @@ uploaded_file = st.file_uploader(
 if uploaded_file is not None:
   st.video(uploaded_file)
 
-  if st.button("🚀 見た目ロックオン解析を開始"):
+  if st.button("🚀 全員マルチID追跡解析を開始"):
     tfile = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
     tfile.write(uploaded_file.read())
 
@@ -177,9 +190,14 @@ if uploaded_file is not None:
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     progress_bar = st.progress(0)
 
-    flyer_histogram = None  # フライヤーの登録済み見た目データ
-    frame_count = 0
+    # トラッカーの初期化
+    if hasattr(model, "tracker") and model.tracker is not None:
+      try:
+        model.tracker.reset()
+      except AttributeError:
+        pass
 
+    frame_count = 0
     while cap.isOpened():
       ret, frame = cap.read()
       if not ret:
@@ -190,9 +208,9 @@ if uploaded_file is not None:
 
       frame_count += 1
 
+      # 全員の骨格を描画 (pts は ID をキーとする辞書)
       if len(pts) > 0:
-        candidates = []
-        for person_id, kpts_data in pts.items():
+        for track_id, kpts_data in pts.items():
           kpts = (
               np.array(kpts_data["keypoints"])
               if isinstance(kpts_data, dict)
@@ -200,71 +218,8 @@ if uploaded_file is not None:
           )
 
           if kpts.ndim == 2:
-            hist = extract_color_histogram(frame, kpts)
-            # 画面内での平均高さ (Y座標の小ささ = 高さ)
-            avg_y = np.mean(kpts[:, 1]) if len(kpts) > 0 else 9999
-            candidates.append({
-                "kpts": kpts,
-                "hist": hist,
-                "avg_y": avg_y,
-            })
-
-        # --- フライヤーの初回ロックオン（一番高い位置にいる人物を登録） ---
-        if flyer_histogram is None and len(candidates) > 0:
-          # Y座標が最も上（最小）の人物を初期フライヤーとして登録
-          candidates_sorted = sorted(candidates, key=lambda x: x["avg_y"])
-          flyer_candidate = candidates_sorted[0]
-          if flyer_candidate["hist"] is not None:
-            flyer_histogram = flyer_candidate["hist"]
-            out_frame = draw_skeleton(out_frame, flyer_candidate["kpts"])
-            cv2.putText(
-                out_frame,
-                "FLYER LOCKED (Registered)",
-                (30, 50),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                1.0,
-                (0, 255, 0),
-                3,
-            )
-
-        # --- 2フレーム目以降：見た目の類似度でフライヤーを特定 ---
-        elif flyer_histogram is not None and len(candidates) > 0:
-          best_match = None
-          best_score = -1.0
-
-          for cand in candidates:
-            score = compare_histograms(flyer_histogram, cand["hist"])
-            if score > best_score:
-              best_score = score
-              best_match = cand
-
-          if best_match is not None and best_score >= color_similarity_thresh:
-            out_frame = draw_skeleton(out_frame, best_match["kpts"])
-
-            # 見た目特徴量を少しずつ更新（照明変化や体勢変化に対応）
-            if best_match["hist"] is not None:
-              flyer_histogram = (
-                  0.85 * flyer_histogram + 0.15 * best_match["hist"]
-              )
-
-            cv2.putText(
-                out_frame,
-                f"TRACKING FLYER (Match: {best_score * 100:.0f}%)",
-                (30, 50),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                1.0,
-                (0, 255, 0),
-                2,
-            )
-          else:
-            cv2.putText(
-                out_frame,
-                "SEARCHING FLYER...",
-                (30, 50),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                1.0,
-                (0, 0, 255),
-                2,
+            out_frame = draw_person_skeleton(
+                out_frame, kpts, track_id, conf_thresh=conf_threshold
             )
 
       out_frame_rgb = cv2.cvtColor(out_frame, cv2.COLOR_BGR2RGB)
@@ -275,5 +230,5 @@ if uploaded_file is not None:
 
     cap.release()
     st.success(
-        "🎉 動画の解析が完了しました！フライヤーの見た目を保持して追跡できました。"
+        "🎉 動画の解析が完了しました！チーム全員のIDと骨格が可視化されました。"
     )
