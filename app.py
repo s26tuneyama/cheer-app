@@ -4,7 +4,7 @@ import numpy as np
 import tempfile
 import os
 import json
-from ultralytics import YOLO
+import openpifpaf
 
 # ==========================================
 # 0. フィードバック集計用の設定
@@ -26,7 +26,6 @@ if "feedback_given" not in st.session_state:
 
 # ==========================================
 # 1. 知識ベース（ルール・制約・アドバイス）
-# ★オントロジー（物理的制約）もここに定義！
 # ==========================================
 KNOWLEDGE_BASE_JSON = """
 {
@@ -64,7 +63,7 @@ KNOWLEDGE_BASE_JSON = """
 knowledge = json.loads(KNOWLEDGE_BASE_JSON)
 
 # ==========================================
-# 2. 処理機構（汎用的なロジック層）
+# 2. 処理機構（ロジック層）
 # ==========================================
 def calculate_angle(a, b, c):
     a, b, c = np.array(a), np.array(b), np.array(c)
@@ -74,7 +73,6 @@ def calculate_angle(a, b, c):
     return np.degrees(np.arccos(np.clip(cosine_angle, -1.0, 1.0)))
 
 def get_body_axis(kpts, l_idx, r_idx, min_conf=0.5, expected_y_below=None):
-    """オントロジー制約（expected_y_below）に従って体の中心点を推測する"""
     valid_pts = []
     for idx in (l_idx, r_idx):
         pt = kpts[idx]
@@ -88,31 +86,35 @@ def get_body_axis(kpts, l_idx, r_idx, min_conf=0.5, expected_y_below=None):
         return valid_pts[0]
     return None
 
-def extract_jump_metrics(video_path, model):
+def extract_jump_metrics(video_path, predictor):
     cap = cv2.VideoCapture(video_path)
     history = []
     
-    # --- 動画から「一番高い人」を全フレーム追跡 ---
+    # --- OpenPifPafで「一番高い人(トップ)」を追跡 ---
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret: break
 
-        results = model(frame, verbose=False)
-        result = results[0]
+        # OpenPifPafはRGB画像を期待するため変換
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         
-        if len(result.keypoints) > 0:
+        # ボトムアップ方式で全関節のベクトルから人を組み立てる
+        predictions, gt_anns, image_meta = predictor.numpy_image(frame_rgb)
+        
+        if len(predictions) > 0:
             best_kpts = None
             min_hip_y_in_frame = float('inf')
             
-            for kpts in result.keypoints.data:
-                kpts_np = kpts.cpu().numpy()
+            for ann in predictions:
+                kpts_np = ann.data # 形状は(17, 3) [x, y, confidence]
                 l_hip, r_hip = kpts_np[11], kpts_np[12]
                 
-                if l_hip[2] > 0.5 and r_hip[2] > 0.5:
+                # スタンツのトップ（最も高い位置に腰がある人物）を特定
+                if l_hip[2] > 0.4 and r_hip[2] > 0.4:
                     hip_y = (l_hip[1] + r_hip[1]) / 2
                     if hip_y < min_hip_y_in_frame:
                         min_hip_y_in_frame = hip_y
-                        best_kpts = kpts_np
+                        best_kpts = kpts_np.copy()
             
             if best_kpts is not None:
                 history.append({"frame": frame.copy(), "kpts": best_kpts, "hip_y": min_hip_y_in_frame})
@@ -127,7 +129,6 @@ def extract_jump_metrics(video_path, model):
     apex_data = history[apex_idx]
     apex_frame, apex_kpts = apex_data["frame"], apex_data["kpts"]
     
-    # 知識ベース（JSON）からスナップダウン時の制約をロード
     snap_ontology = knowledge["ontology"]["phases"]["SNAP_DOWN"]["constraints"]
     ankle_margin = snap_ontology.get("ankle_must_be_below_hip_margin", 20)
     knee_below_target = snap_ontology.get("knee_must_be_below")
@@ -139,8 +140,6 @@ def extract_jump_metrics(video_path, model):
         kpts = data["kpts"]
         
         c_hip = get_body_axis(kpts, 11, 12, min_conf=0.5)
-        
-        # 制約：足首は腰より[マージン]分下にあるべき
         c_ankle = get_body_axis(kpts, 15, 16, min_conf=0.4)
         if c_hip is not None and c_ankle is not None and c_ankle[1] > c_hip[1] + ankle_margin:
             snap_frame = data["frame"]
@@ -151,7 +150,7 @@ def extract_jump_metrics(video_path, model):
         snap_frame = history[apex_idx + 5]["frame"]
         snap_kpts = history[apex_idx + 5]["kpts"]
 
-    # --- ③ 角度の計算（オントロジー制約の適用） ---
+    # --- ③ 角度の計算 ---
     metrics = {}
     if apex_kpts is not None and snap_kpts is not None:
         metrics["r_knee_angle"] = calculate_angle(apex_kpts[12][:2], apex_kpts[14][:2], apex_kpts[16][:2])
@@ -160,14 +159,12 @@ def extract_jump_metrics(video_path, model):
         c_shoulder = get_body_axis(snap_kpts, 5, 6)
         c_hip = get_body_axis(snap_kpts, 11, 12)
         
-        # 制約：膝が腰(hip)より下にあるべきなら、それを条件にフィルター
         knee_constraint_y = c_hip[1] if (knee_below_target == "hip" and c_hip is not None) else None
         c_knee = get_body_axis(snap_kpts, 13, 14, expected_y_below=knee_constraint_y)
         
         if c_shoulder is not None and c_hip is not None and c_knee is not None:
             metrics["waist_flexion"] = calculate_angle(c_shoulder, c_hip, c_knee)
         else:
-            # 物理的制約に反してパーツが見えない場合は推測不能（一直線=180度）とする
             metrics["waist_flexion"] = 180.0 
         
     return metrics, apex_frame, apex_kpts, snap_frame, snap_kpts
@@ -187,15 +184,12 @@ def evaluate_metrics(metrics, rules):
     return tags
 
 def draw_custom_keypoints(image, keypoints, phase_name, ontology_constraints=None):
-    """描画時にもオントロジー制約を適用してAIの幻覚（無駄な線）を描かない"""
     img_draw = image.copy()
     
-    hip_y = (keypoints[11][1] + keypoints[12][1]) / 2 if (keypoints[11][2]>0.5 and keypoints[12][2]>0.5) else 0
+    hip_y = (keypoints[11][1] + keypoints[12][1]) / 2 if (keypoints[11][2]>0.4 and keypoints[12][2]>0.4) else 0
     
     def is_valid_draw(idx, is_lower_body=False):
-        if keypoints[idx][2] < 0.4: return False
-        
-        # 知識ベースからの制約があれば適用
+        if keypoints[idx][2] < 0.3: return False # OpenPifPafは少し閾値を下げる
         if is_lower_body and ontology_constraints and hip_y > 0:
             if ontology_constraints.get("knee_must_be_below") == "hip":
                 if keypoints[idx][1] < hip_y: return False 
@@ -222,18 +216,18 @@ st.title("📣 チア トータッチ診断 AI")
 
 @st.cache_resource
 def load_model():
-    return YOLO('yolov8s-pose.pt') 
+    # 軽量かつ精度のバランスが良い shufflenetv2k16 をロード
+    return openpifpaf.Predictor(checkpoint='shufflenetv2k16')
 
 model = load_model()
 uploaded_file = st.file_uploader("動画をアップロード", type=["mp4", "mov", "avi"])
 
 if uploaded_file is not None:
-    # 新しい動画がアップロードされたらフィードバック状態をリセット
     if "current_file" not in st.session_state or st.session_state.current_file != uploaded_file.name:
         st.session_state.feedback_given = False
         st.session_state.current_file = uploaded_file.name
 
-    with st.spinner('ジャンプ全体を解析中...（数十秒かかります）'):
+    with st.spinner('ボトムアップ方式で関節ベクトルを解析中...（YOLOより少し時間がかかります）'):
         tfile = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
         tfile.write(uploaded_file.read())
         tfile.flush()
@@ -246,7 +240,6 @@ if uploaded_file is not None:
             else:
                 tags = evaluate_metrics(metrics, knowledge["rules"])
                 
-                # 描画時にもJSONのオントロジー制約を渡す
                 snap_constraints = knowledge["ontology"]["phases"]["SNAP_DOWN"]["constraints"]
                 img_apex = draw_custom_keypoints(apex_frame, apex_kpts, "APEX (Peak)")
                 img_snap = draw_custom_keypoints(snap_frame, snap_kpts, "SNAP DOWN", snap_constraints)
@@ -301,4 +294,3 @@ if uploaded_file is not None:
         finally:
             tfile.close()
             os.unlink(tfile.name)
-
