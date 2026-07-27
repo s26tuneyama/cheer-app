@@ -1,9 +1,8 @@
---extra-index-url https://download.pytorch.org/whl/cpu
-torch
-torchvision
-numpy<2.0.0
 streamlit
 opencv-python-headless
+numpy<2.0.0
 pillow
+torch
+torchvision
 openpifpaf
 
