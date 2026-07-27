@@ -1,8 +1,5 @@
 streamlit
 opencv-python-headless
-numpy<2.0.0
-pillow
 torch
 torchvision
-openpifpaf
-
+git+https://github.com/JunkyByte/easy_ViTPose.git
