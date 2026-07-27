@@ -4,50 +4,59 @@ import urllib.request
 import cv2
 from huggingface_hub import hf_hub_download
 import numpy as np
+import pandas as pd
 import streamlit as st
 import torch
 from easy_ViTPose import VitInference
 
+# COCO 17キーポイントの名称リスト
+KEYPOINT_NAMES = [
+    "Nose",
+    "L_Eye",
+    "R_Eye",
+    "L_Ear",
+    "R_Ear",
+    "L_Shoulder",
+    "R_Shoulder",
+    "L_Elbow",
+    "R_Elbow",
+    "L_Wrist",
+    "R_Wrist",
+    "L_Hip",
+    "R_Hip",
+    "L_Knee",
+    "R_Knee",
+    "L_Ankle",
+    "R_Ankle",
+]
+
 # --------------------------------------------------
 # アプリのタイトルと説明
 # --------------------------------------------------
-st.title("🤸‍♀️ チアリーディング骨格検出アプリ (ViTPose版)")
+st.title("🔍 骨格推定データ欠損デバッグアプリ")
 st.write(
-    "Vision Transformer"
-    " と動画トラッキングを使用し、空中トスやブレに強く骨格を追従します。"
+    "1フレームごとに『データ不在（見失い）』か『低確信度（低Score）』かをリアルタイムで計測・ログ出力します。"
 )
 
 # --------------------------------------------------
-# サイドバー設定 (感度 & トラッキング)
+# サイドバー設定
 # --------------------------------------------------
 st.sidebar.title("⚙️ 解析パラメータ設定")
 
-# 1. 検出感度スライダー
 conf_threshold = st.sidebar.slider(
     "検出感度 (YOLO Confidence)",
     min_value=0.10,
     max_value=0.80,
     value=0.20,
     step=0.05,
-    help=(
-        "値を下げると(例:"
-        " 0.15〜0.25)、高速移動やブレで不鮮明になったフライヤーも見失わずに検出し続けます。"
-    ),
 )
 
-# 2. 解像度設定
 yolo_size = st.sidebar.selectbox(
-    "YOLO入力サイズ (解像度)",
-    options=[320, 640],
-    index=1,
-    help="640にすると遠くのフライヤーや複雑な体勢の検出精度が上がります。",
+    "YOLO入力サイズ (解像度)", options=[320, 640], index=1
 )
 
-# 3. トラッキング有効化スイッチ
 use_tracking = st.sidebar.checkbox(
-    "動画トラッキング (ByteTrack) を有効化",
-    value=True,
-    help="フレーム間で同一人物を識別・追跡し、一瞬の骨格スキップを強力に補正します。",
+    "動画トラッキング (ByteTrack) を有効化", value=False
 )
 
 
@@ -58,19 +67,16 @@ use_tracking = st.sidebar.checkbox(
 def load_vitpose_model(yolo_size_val: int, is_video_val: bool):
   device = "cuda" if torch.cuda.is_available() else "cpu"
 
-  # 1. ViTPoseモデルをダウンロード
   model_file = hf_hub_download(
       repo_id="JunkyByte/easy_ViTPose", filename="torch/coco/vitpose-s-coco.pth"
   )
 
-  # 2. YOLO Large (yolov8l.pt) を公式から直接ダウンロード (大型化で変形姿勢への追従強化)
   yolo_file = "yolov8l.pt"
   if not os.path.exists(yolo_file):
     url = "https://github.com/ultralytics/assets/releases/download/v8.2.0/yolov8l.pt"
     with st.spinner("🧠 大型AIモデル (YOLOv8-Large) を初回ダウンロード中..."):
       urllib.request.urlretrieve(url, yolo_file)
 
-  # 3. モデルの初期化
   model = VitInference(
       model=model_file,
       yolo=yolo_file,
@@ -83,87 +89,165 @@ def load_vitpose_model(yolo_size_val: int, is_video_val: bool):
   return model
 
 
-# モデル読み込み
 with st.spinner("AIモデルを読み込み中..."):
   model = load_vitpose_model(yolo_size, use_tracking)
 
-# 検出感度（Confidence）の動的反映
 try:
   model.yolo.conf = conf_threshold
 except AttributeError:
   pass
 
 # --------------------------------------------------
-# ファイルのアップロード & 解析処理
+# 動画アップロード & デバッグ解析処理
 # --------------------------------------------------
 st.subheader("📁 メディアのアップロード")
 uploaded_file = st.file_uploader(
-    "解析したい動画（MP4/MOV）または画像（JPG/PNG）を選択してください",
-    type=["mp4", "mov", "avi", "jpg", "png", "jpeg"],
+    "デバッグしたい動画を選択してください", type=["mp4", "mov", "avi"]
 )
 
 if uploaded_file is not None:
-  file_type = uploaded_file.name.split(".")[-1].lower()
+  st.video(uploaded_file)
 
-  # 【1】 画像ファイルの場合
-  if file_type in ["jpg", "png", "jpeg"]:
-    st.image(
-        uploaded_file, caption="アップロード画像", use_container_width=True
+  if st.button("🚨 デバッグ解析を開始"):
+    tfile = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+    tfile.write(uploaded_file.read())
+
+    cap = cv2.VideoCapture(tfile.name)
+
+    # レイアウトの構築
+    col1, col2 = st.columns([3, 2])
+    with col1:
+      st_frame = st.empty()
+    with col2:
+      st.markdown("### 📊 リアルタイム・デバッグログ")
+      st_status = st.empty()
+      st_metrics = st.empty()
+      st_kpt_table = st.empty()
+
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    progress_bar = st.progress(0)
+
+    # 統計用データ格納
+    frame_logs = []
+    missing_frames = 0
+    frame_count = 0
+
+    while cap.isOpened():
+      ret, frame = cap.read()
+      if not ret:
+        break
+
+      pts = model.inference(frame)
+      out_frame = model.draw()
+
+      frame_count += 1
+      is_missing = len(pts) == 0
+
+      if is_missing:
+        missing_frames += 1
+        st_status.error(
+            f"❌ **Frame {frame_count}**: 人物未検出 (データ空っぽ)"
+        )
+
+        # 画面にエラー文字を描画
+        cv2.putText(
+            out_frame,
+            "MISSING (No Detection)",
+            (30, 50),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1.0,
+            (0, 0, 255),
+            3,
+        )
+
+        frame_logs.append({
+            "frame": frame_count,
+            "detected": False,
+            "avg_conf": 0.0,
+            "min_conf": 0.0,
+        })
+      else:
+        st_status.success(
+            f"✅ **Frame {frame_count}**: 人物検出完了 ({len(pts)}人)"
+        )
+
+        # 先頭の人物（フライヤー想定）の確信度を抽出
+        kpts = list(pts.values())[0]  # shape: (17, 3) など
+
+        # 確信度カラムの取得 (3列目があればそれがconfidence)
+        if kpts.shape[1] >= 3:
+          confs = kpts[:, 2]
+        else:
+          confs = np.ones(17)  # 確信度情報がない場合のフォールバック
+
+        avg_conf = float(np.mean(confs))
+        min_conf = float(np.min(confs))
+
+        # 画面に平均確信度を描画
+        cv2.putText(
+            out_frame,
+            f"Avg Conf: {avg_conf:.2f}",
+            (30, 50),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1.0,
+            (0, 255, 0),
+            2,
+        )
+
+        # メトリクス表示
+        st_metrics.metric(
+            label="現在のキーポイント平均確信度",
+            value=f"{avg_conf * 100:.1f}%",
+            delta=f"最低関節: {min_conf * 100:.1f}%",
+        )
+
+        # 各関節の確信度テーブル作成
+        df_kpts = pd.DataFrame(
+            {"関節名": KEYPOINT_NAMES, "確信度 (%)": (confs * 100).round(1)}
+        )
+        st_kpt_table.dataframe(df_kpts.style.highlight_between(left=0, right=30, color="#ffcdd2"), height=250)
+
+        frame_logs.append({
+            "frame": frame_count,
+            "detected": True,
+            "avg_conf": avg_conf,
+            "min_conf": min_conf,
+        })
+
+      # 映像更新
+      out_frame_rgb = cv2.cvtColor(out_frame, cv2.COLOR_BGR2RGB)
+      st_frame.image(out_frame_rgb, channels="RGB", use_container_width=True)
+
+      if total_frames > 0:
+        progress_bar.progress(min(frame_count / total_frames, 1.0))
+
+    cap.release()
+
+    # --------------------------------------------------
+    # 最終分析サマリーレポート
+    # --------------------------------------------------
+    st.markdown("---")
+    st.subheader("📋 デバッグ分析結果サマリー")
+
+    missing_rate = (
+        (missing_frames / frame_count * 100) if frame_count > 0 else 0
     )
 
-    if st.button("✨ 骨格検出を実行 (画像)"):
-      with st.spinner("AI骨格検出を実行中..."):
-        file_bytes = np.asarray(
-            bytearray(uploaded_file.read()), dtype=np.uint8
-        )
-        img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+    col_a, col_b, col_c = st.columns(3)
+    col_a.metric("総フレーム数", f"{frame_count} frames")
+    col_b.metric("データ消失（未検出）コマ数", f"{missing_frames} frames")
+    col_c.metric("データ消失率", f"{missing_rate:.1f}%")
 
-        pts = model.inference(img)
-        res_img = model.draw()
-
-        res_img_rgb = cv2.cvtColor(res_img, cv2.COLOR_BGR2RGB)
-        st.image(
-            res_img_rgb, caption="解析完了（結果）", use_container_width=True
-        )
-        st.success("骨格検出が完了しました！")
-
-  # 【2】 動画ファイルの場合
-  else:
-    st.video(uploaded_file)
-
-    if st.button("🚀 骨格検出を開始 (動画解析)"):
-      tfile = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-      tfile.write(uploaded_file.read())
-
-      cap = cv2.VideoCapture(tfile.name)
-      st_frame = st.empty()
-
-      total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-      progress_bar = st.progress(0)
-
-      # トラッカーが存在する場合は初期化
-      if hasattr(model, "tracker") and model.tracker is not None:
-        try:
-          model.tracker.reset()
-        except AttributeError:
-          pass
-
-      frame_count = 0
-      while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret:
-          break
-
-        pts = model.inference(frame)
-        out_frame = model.draw()
-
-        out_frame_rgb = cv2.cvtColor(out_frame, cv2.COLOR_BGR2RGB)
-        st_frame.image(out_frame_rgb, channels="RGB", use_container_width=True)
-
-        frame_count += 1
-        if total_frames > 0:
-          progress_bar.progress(min(frame_count / total_frames, 1.0))
-
-      cap.release()
-      st.success("🎉 動画の全フレーム解析が完了しました！")
+    if missing_rate > 15:
+      st.warning(
+          "⚠️ **主な原因: 人物検出（YOLO）の途切れ**\n"
+          f"全体の {missing_rate:.1f}% のコマでAIが人を完全に見失っています。"
+          "YOLOの閾値を下げるか、前後のデータ補間（Interpolation）が必要です。"
+      )
+    else:
+      st.info(
+          "💡 **主な原因: 関節確信度（Confidence）の低下**\n"
+          "人物自体は見失っていませんが、特定の関節の確信度が低いため描画ルールにより画面上で消えています。"
+          "描画閾値の解除、または欠損キーポイントの補間処理でキレイに接続可能です。"
+      )
 
