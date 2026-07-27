@@ -5,4 +5,5 @@ ultralytics
 scikit-image
 filterpy
 lapx
+ffmpeg-python
 git+https://github.com/JunkyByte/easy_ViTPose.git
