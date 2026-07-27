@@ -6,4 +6,5 @@ scikit-image
 filterpy
 lapx
 ffmpeg-python
+huggingface_hub
 git+https://github.com/JunkyByte/easy_ViTPose.git
