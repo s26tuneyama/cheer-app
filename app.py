@@ -1,4 +1,6 @@
+import os
 import tempfile
+import urllib.request
 import cv2
 from huggingface_hub import hf_hub_download
 import numpy as np
@@ -6,7 +8,9 @@ import streamlit as st
 import torch
 from easy_ViTPose import VitInference
 
+# --------------------------------------------------
 # アプリのタイトルと説明
+# --------------------------------------------------
 st.title("🤸‍♀️ チアリーディング骨格検出アプリ (ViTPose版)")
 st.write(
     "Vision Transformer"
@@ -18,7 +22,7 @@ st.write(
 # --------------------------------------------------
 st.sidebar.title("⚙️ 解析パラメータ設定")
 
-# 1. 検出感度スライダー (低いほど空中ブレでも見失わない)
+# 1. 検出感度スライダー
 conf_threshold = st.sidebar.slider(
     "検出感度 (YOLO Confidence)",
     min_value=0.10,
@@ -46,25 +50,27 @@ use_tracking = st.sidebar.checkbox(
     help="フレーム間で同一人物を識別・追跡し、一瞬の骨格スキップを強力に補正します。",
 )
 
+
 # --------------------------------------------------
-# ViTPoseモデルのロード（キャッシュ機能つき）
+# ViTPoseモデルのロード（YOLO Large版）
 # --------------------------------------------------
-
-
-
 @st.cache_resource
 def load_vitpose_model(yolo_size_val: int, is_video_val: bool):
   device = "cuda" if torch.cuda.is_available() else "cpu"
 
+  # 1. ViTPoseモデルをダウンロード
   model_file = hf_hub_download(
       repo_id="JunkyByte/easy_ViTPose", filename="torch/coco/vitpose-s-coco.pth"
   )
 
-  # YOLOモデルを 's' (Small) から 'l' (Large) に変更して変形姿勢への追従力を強化
-  yolo_file = hf_hub_download(
-      repo_id="JunkyByte/easy_ViTPose", filename="yolov8/yolov8l.pt"
-  )
+  # 2. YOLO Large (yolov8l.pt) を公式から直接ダウンロード (大型化で変形姿勢への追従強化)
+  yolo_file = "yolov8l.pt"
+  if not os.path.exists(yolo_file):
+    url = "https://github.com/ultralytics/assets/releases/download/v8.2.0/yolov8l.pt"
+    with st.spinner("🧠 大型AIモデル (YOLOv8-Large) を初回ダウンロード中..."):
+      urllib.request.urlretrieve(url, yolo_file)
 
+  # 3. モデルの初期化
   model = VitInference(
       model=model_file,
       yolo=yolo_file,
@@ -160,3 +166,4 @@ if uploaded_file is not None:
 
       cap.release()
       st.success("🎉 動画の全フレーム解析が完了しました！")
+
