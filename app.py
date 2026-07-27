@@ -42,9 +42,6 @@ def load_vitpose_model():
 
 
 
-
-
-
 # モデル読み込み
 with st.spinner("AIモデルを読み込んでいます..."):
     model = load_vitpose_model()
