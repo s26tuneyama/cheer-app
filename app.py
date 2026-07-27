@@ -26,16 +26,19 @@ def load_vitpose_model():
     model_path = hf_hub_download(repo_id="JunkyByte/easy_ViTPose", filename="torch/coco/vitpose-s-coco.pth")
     yolo_path = hf_hub_download(repo_id="JunkyByte/easy_ViTPose", filename="yolov8/yolov8s.pt")
 
-    # 2. パラメータ名を明示して安全に初期化（dataset='coco'を追加）
+    # 2. ライブラリの定義通りの順番（位置引数）で全パラメータを渡して初期化
     model = VitInference(
-        model_path=model_path,
-        yolo_path=yolo_path,
-        model_name='s',
-        yolo_size=320,
-        dataset='coco',
-        device=device
+        model_path, # 1. ViTPose重み
+        yolo_path,  # 2. YOLO重み
+        's',        # 3. model_name
+        320,        # 4. yolo_size
+        'coco',     # 5. dataset
+        False,      # 6. is_video
+        False,      # 7. single_pose
+        device      # 8. device ('cpu' / 'cuda')
     )
     return model
+
 
 
 
