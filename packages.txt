@@ -1,9 +1,5 @@
-streamlit
-torch
-torchvision
-ultralytics
-scikit-image
-filterpy
-lapx
-git+https://github.com/JunkyByte/easy_ViTPose.git
-
+ffmpeg
+libgl1
+libglib2.0-0t64
+libsm6
+libxext6
