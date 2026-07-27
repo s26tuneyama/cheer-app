@@ -51,6 +51,7 @@ use_tracking = st.sidebar.checkbox(
 # --------------------------------------------------
 
 
+
 @st.cache_resource
 def load_vitpose_model(yolo_size_val: int, is_video_val: bool):
   device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -58,11 +59,12 @@ def load_vitpose_model(yolo_size_val: int, is_video_val: bool):
   model_file = hf_hub_download(
       repo_id="JunkyByte/easy_ViTPose", filename="torch/coco/vitpose-s-coco.pth"
   )
+
+  # YOLOモデルを 's' (Small) から 'l' (Large) に変更して変形姿勢への追従力を強化
   yolo_file = hf_hub_download(
-      repo_id="JunkyByte/easy_ViTPose", filename="yolov8/yolov8s.pt"
+      repo_id="JunkyByte/easy_ViTPose", filename="yolov8/yolov8l.pt"
   )
 
-  # is_video_val=True でライブラリ内部のトラッカーが起動します
   model = VitInference(
       model=model_file,
       yolo=yolo_file,
