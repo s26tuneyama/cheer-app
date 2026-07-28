@@ -175,11 +175,13 @@ if uploaded_file is not None:
                 else:
                     st.write("着地画像の画像を取得できませんでした")
 
+
             # --- F. AIフォーム診断レポート表示 ---
             st.markdown("---")
             st.subheader("📋 AIフォーム診断レポート")
             
-            diagnoses = tech_module.generate_diagnosis(peak_data, descent_data)
+            # trajectoryを引数に追加渡し
+            diagnoses = tech_module.generate_diagnosis(peak_data, descent_data, trajectory)
             
             for item in diagnoses:
                 if item.startswith("###") or item == "---":
@@ -188,6 +190,7 @@ if uploaded_file is not None:
                     st.warning(item)
                 else:
                     st.success(item)
+
 
     # クリーンアップ
     try:
