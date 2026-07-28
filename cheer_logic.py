@@ -16,9 +16,9 @@ def calculate_angle(a, b, c):
     cosine_angle = np.clip(np.dot(ba, bc) / (norm_ba * norm_bc), -1.0, 1.0)
     return float(np.degrees(np.arccos(cosine_angle)))
 
-def extract_mediapipe_angles(frame, bbox):
+def extract_mediapipe_angles(frame, bbox, pose_estimator):
     """
-    フライヤー周辺をクロップし、MediaPipe Poseで33箇所のキーポイント（つま先含む）を取得
+    再利用可能な pose_estimator を使ってMediaPipeで骨格を取得（爆速化）
     """
     h_orig, w_orig, _ = frame.shape
     x1, y1, x2, y2 = map(int, bbox)
@@ -33,62 +33,56 @@ def extract_mediapipe_angles(frame, bbox):
         return {'split_angle': None, 'arch_angle': None, 'mp_kpts': {}}
 
     crop_rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+    results = pose_estimator.process(crop_rgb)
     
-    with mp_pose.Pose(static_image_mode=True, model_complexity=1, min_detection_confidence=0.3) as pose:
-        results = pose.process(crop_rgb)
-        
-        if not results.pose_landmarks:
-            return {'split_angle': None, 'arch_angle': None, 'mp_kpts': {}}
+    if not results.pose_landmarks:
+        return {'split_angle': None, 'arch_angle': None, 'mp_kpts': {}}
 
-        landmarks = results.pose_landmarks.landmark
-        
-        kpts = {}
-        crop_h, crop_w, _ = crop.shape
-        for idx, lm in enumerate(landmarks):
-            if lm.visibility > 0.2:
-                abs_x = int(lm.x * crop_w + cx1)
-                abs_y = int(lm.y * crop_h + cy1)
-                kpts[idx] = [abs_x, abs_y, lm.visibility]
+    landmarks = results.pose_landmarks.landmark
+    kpts = {}
+    crop_h, crop_w, _ = crop.shape
+    for idx, lm in enumerate(landmarks):
+        if lm.visibility > 0.2:
+            abs_x = int(lm.x * crop_w + cx1)
+            abs_y = int(lm.y * crop_h + cy1)
+            kpts[idx] = [abs_x, abs_y, lm.visibility]
 
-        # 1. 開脚角度（腰 - つま先/足首）
-        split_angle = None
-        hip_center = None
-        if 23 in kpts and 24 in kpts:
-            hip_center = [(kpts[23][0] + kpts[24][0])/2, (kpts[23][1] + kpts[24][1])/2]
-        
-        left_foot = kpts.get(31, kpts.get(27))
-        right_foot = kpts.get(32, kpts.get(28))
+    # 1. 開脚角度（腰 - つま先/足首）
+    split_angle = None
+    hip_center = None
+    if 23 in kpts and 24 in kpts:
+        hip_center = [(kpts[23][0] + kpts[24][0])/2, (kpts[23][1] + kpts[24][1])/2]
+    
+    left_foot = kpts.get(31, kpts.get(27))
+    right_foot = kpts.get(32, kpts.get(28))
 
-        if hip_center and left_foot and right_foot:
-            split_angle = calculate_angle(left_foot, hip_center, right_foot)
+    if hip_center and left_foot and right_foot:
+        split_angle = calculate_angle(left_foot, hip_center, right_foot)
 
-        # 2. 体の反り角度（肩 - 腰 - 足首）
-        arch_angle = None
-        shoulder_center = None
-        foot_center = None
-        if 11 in kpts and 12 in kpts:
-            shoulder_center = [(kpts[11][0] + kpts[12][0])/2, (kpts[11][1] + kpts[12][1])/2]
-        if 27 in kpts and 28 in kpts:
-            foot_center = [(kpts[27][0] + kpts[28][0])/2, (kpts[27][1] + kpts[28][1])/2]
+    # 2. 体の反り角度（肩 - 腰 - 足首）
+    arch_angle = None
+    shoulder_center = None
+    foot_center = None
+    if 11 in kpts and 12 in kpts:
+        shoulder_center = [(kpts[11][0] + kpts[12][0])/2, (kpts[11][1] + kpts[12][1])/2]
+    if 27 in kpts and 28 in kpts:
+        foot_center = [(kpts[27][0] + kpts[28][0])/2, (kpts[27][1] + kpts[28][1])/2]
 
-        if shoulder_center and hip_center and foot_center:
-            arch_angle = calculate_angle(shoulder_center, hip_center, foot_center)
+    if shoulder_center and hip_center and foot_center:
+        arch_angle = calculate_angle(shoulder_center, hip_center, foot_center)
 
-        return {
-            'split_angle': round(split_angle, 1) if split_angle else None,
-            'arch_angle': round(arch_angle, 1) if arch_angle else None,
-            'mp_kpts': kpts
-        }
+    return {
+        'split_angle': round(split_angle, 1) if split_angle else None,
+        'arch_angle': round(arch_angle, 1) if arch_angle else None,
+        'mp_kpts': kpts
+    }
 
 def analyze_cheer_flyer_descent(video_path, raw_frames, max_jump_distance=180.0, min_size_ratio=0.01, min_peak_conf=0.20):
     """
-    1. 人間（骨格）が取れた検出のみをフィルタリング
-    2. その中から最も高い位置にあるものを最高到達点として判定
+    高い位置にある物体から優先的にMediaPipeチェックを行い、本物のフライヤー（最高到達点）を爆速特定
     """
-    cap = cv2.VideoCapture(video_path)
-    valid_candidates = []
-
-    # 全コマの検出結果から「本当に人間であるもの（骨格が5箇所以上取れたもの）」を抽出
+    # 全コマから候補となる検出結果を抽出
+    candidates = []
     for frame_info in raw_frames:
         f_idx = frame_info['frame_idx']
         f_height = frame_info.get('frame_height', 1080)
@@ -99,55 +93,73 @@ def analyze_cheer_flyer_descent(video_path, raw_frames, max_jump_distance=180.0,
             if det.get('box_height', 0) < min_box_h: continue
             if det['conf'] < min_peak_conf: continue
 
-            cap.set(cv2.CAP_PROP_POS_FRAMES, f_idx)
+            c_data = det.copy()
+            c_data['frame_idx'] = f_idx
+            candidates.append(c_data)
+
+    if not candidates:
+        return []
+
+    # Y座標が上（数値が小さい）順にソート（高い位置の物体を優先）
+    candidates.sort(key=lambda x: x['center'][1])
+
+    cap = cv2.VideoCapture(video_path)
+    peak_detection = None
+
+    # MediaPipeモデルを1回だけ生成（メモリ＆CPU節約）
+    with mp_pose.Pose(static_image_mode=True, model_complexity=1, min_detection_confidence=0.3) as pose:
+        # 一番高い物体から順に人間チェック（ライト等のノイズは弾く）
+        for cand in candidates:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, cand['frame_idx'])
             ret, frame = cap.read()
             if not ret or frame is None: continue
 
-            # MediaPipeによる人間チェック
-            mp_res = extract_mediapipe_angles(frame, det['bbox'])
+            mp_res = extract_mediapipe_angles(frame, cand['bbox'], pose)
             
-            # ★ ライトなどの誤検知を防ぐ：キーポイントが5つ以上取れた「本物の人間」だけを許可
+            # 骨格（キーポイント）が5箇所以上検出されたら「本物のフライヤー」と判定！
             if len(mp_res.get('mp_kpts', {})) >= 5:
-                cand = det.copy()
-                cand['frame_idx'] = f_idx
-                cand['split_angle'] = mp_res['split_angle']
-                cand['arch_angle'] = mp_res['arch_angle']
-                cand['mp_kpts'] = mp_res['mp_kpts']
-                valid_candidates.append(cand)
+                peak_detection = cand
+                peak_detection['split_angle'] = mp_res['split_angle']
+                peak_detection['arch_angle'] = mp_res['arch_angle']
+                peak_detection['mp_kpts'] = mp_res['mp_kpts']
+                break # 一番高い人間が見つかったので即検索終了！
+
+        if peak_detection is None:
+            cap.release()
+            return []
+
+        # 最高到達点（ピーク）以降の落下軌道だけを追跡してMediaPipe解析
+        peak_frame_idx = peak_detection['frame_idx']
+        trajectory = [peak_detection]
+        prev_center = peak_detection['center']
+
+        descent_frames = [f for f in raw_frames if f['frame_idx'] > peak_frame_idx]
+
+        for frame_info in descent_frames:
+            f_idx = frame_info['frame_idx']
+            valid_dets = [d for d in frame_info['detections'] if not d['is_edge']]
+            if not valid_dets: break
+
+            # 前のコマのフライヤー位置に一番近い物体を選択
+            best_cand = min(valid_dets, key=lambda c: np.sqrt((c['center'][0]-prev_center[0])**2 + (c['center'][1]-prev_center[1])**2))
+            dist = np.sqrt((best_cand['center'][0]-prev_center[0])**2 + (best_cand['center'][1]-prev_center[1])**2)
+
+            if dist > max_jump_distance:
+                break
+
+            cap.set(cv2.CAP_PROP_POS_FRAMES, f_idx)
+            ret, frame = cap.read()
+            if ret and frame is not None:
+                mp_res = extract_mediapipe_angles(frame, best_cand['bbox'], pose)
+                tracked_flyer = best_cand.copy()
+                tracked_flyer['frame_idx'] = f_idx
+                tracked_flyer['split_angle'] = mp_res['split_angle']
+                tracked_flyer['arch_angle'] = mp_res['arch_angle']
+                tracked_flyer['mp_kpts'] = mp_res['mp_kpts']
+                trajectory.append(tracked_flyer)
+                prev_center = tracked_flyer['center']
 
     cap.release()
-
-    if not valid_candidates:
-        return []
-
-    # 「人間」と判定されたものの中で、画面の最も高い位置（Y座標が最小）にあるものをピーク（最高到達点）に設定
-    peak_detection = min(valid_candidates, key=lambda x: x['center'][1])
-    peak_frame_idx = peak_detection['frame_idx']
-
-    # 最高到達点以降の落下軌道を抽出
-    trajectory = [peak_detection]
-    prev_center = peak_detection['center']
-
-    # ピーク以降の人間候補のみを追跡
-    descent_candidates = [c for c in valid_candidates if c['frame_idx'] > peak_frame_idx]
-    
-    current_f = peak_frame_idx
-    while True:
-        # 次のコマの候補を探す
-        next_frame_cands = [c for c in descent_candidates if c['frame_idx'] == current_f + 1 or c['frame_idx'] == current_f + 2]
-        if not next_frame_cands:
-            break
-            
-        best_cand = min(next_frame_cands, key=lambda c: np.sqrt((c['center'][0]-prev_center[0])**2 + (c['center'][1]-prev_center[1])**2))
-        dist = np.sqrt((best_cand['center'][0]-prev_center[0])**2 + (best_cand['center'][1]-prev_center[1])**2)
-        
-        if dist <= max_jump_distance:
-            trajectory.append(best_cand)
-            prev_center = best_cand['center']
-            current_f = best_cand['frame_idx']
-        else:
-            break
-
     return trajectory
 
 def render_flyer_capture(video_path, flyer_data):
