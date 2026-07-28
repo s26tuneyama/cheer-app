@@ -1,145 +1,142 @@
 # app.py
-import streamlit as st
-import cv2
-import tempfile
 import os
+import tempfile
+import cv2
+import streamlit as st
 from ultralytics import YOLO
 
 from cheer_core import analyze_cheer_motion, render_flyer_capture
-from techniques import toe_touch_toss, toe_touch_jump
+from techniques import toe_touch_jump
 
+# 1. ページ基本設定
 st.set_page_config(page_title="Cheer Form Analyzer", layout="wide")
+st.title("📣 Cheer AI Form Analyzer")
+st.caption("トータッチ・ジャンプの最高到達点と着地フォームをAIが判定します")
 
-st.title("📣 チアリーディング フォーム＆技診断 AI")
-st.caption("技ごとの特性（トスの反り / ジャンプの縦伸び）に合わせた専用ロジックで自動解析します。")
-
-# 技の定義とモジュールのマッピング
-TECHNIQUE_MAP = {
-    "トータッチ・トス（フライヤー）": toe_touch_toss,
-    "トータッチ・ジャンプ（ソロ）": toe_touch_jump
-}
-
-st.sidebar.markdown("### 🎯 技の選択")
-technique_type = st.sidebar.selectbox("解析する技の種類を選択", list(TECHNIQUE_MAP.keys()))
-
-st.sidebar.markdown("---")
-st.sidebar.markdown("### ⚡ 処理スピード & 精度設定")
-step_option = st.sidebar.select_slider(
-    "解析スピード",
-    options=["爆速 (4コマごと)", "高速 (3コマごと)", "標準 (2コマごと)", "最高精度 (全コマ)"],
-    value="標準 (2コマごと)"
-)
-
-frame_step = 2
-if "爆速" in step_option: frame_step = 4
-elif "高速" in step_option: frame_step = 3
-elif "標準" in step_option: frame_step = 2
-elif "最高精度" in step_option: frame_step = 1
-
-st.sidebar.markdown("### ⚙️ 検出エリア調整")
-min_conf = st.sidebar.slider("AI全体感度 (Conf)", 0.01, 0.50, 0.15, 0.01)
-min_peak_conf = st.sidebar.slider("ピーク検知の最小確信度", 0.05, 0.80, 0.35, 0.05)
-side_crop_pct = st.sidebar.slider("左右端カット率 (%)", 0, 30, 8, 1)
-top_crop_pct = st.sidebar.slider("天井ノイズカット率 (%)", 0, 20, 2, 1)
-
+# 2. YOLOモデルの読み込み（キャッシュ化して高速化）
 @st.cache_resource
-def load_yolo_model():
+def load_model():
+    # 人体検出用のYOLOモデル（軽量なyolov8nを使用）
     return YOLO("yolov8n.pt")
 
-yolo_model = load_yolo_model()
+model = load_model()
 
-uploaded_file = st.file_uploader("解析する動画ファイルをアップロードしてください (.mp4, .mov)", type=["mp4", "mov"])
+# 3. サイドバー設定
+st.sidebar.header("⚙️ 解析設定")
+selected_technique = st.sidebar.selectbox(
+    "解析する技を選択",
+    ["トータッチ・ジャンプ"]
+)
+
+# モジュールマッピング
+tech_module = toe_touch_jump
+
+# 4. メイン画面：動画アップロード
+uploaded_file = st.file_uploader("解析したい演技動画（MP4 / MOV）をアップロードしてください", type=["mp4", "mov", "avi"])
 
 if uploaded_file is not None:
+    # 一時ファイルとして動画を保存
     tfile = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
     tfile.write(uploaded_file.read())
     video_path = tfile.name
 
     st.video(video_path)
+    
+    if st.button("🚀 AIフォーム解析を実行", type="primary"):
+        with st.spinner("動画をフレーム解析中...（YOLO & MediaPipe処理）"):
+            
+            # --- A. 動画全フレームからYOLOで人体バウンディングボックスを検出 ---
+            cap = cv2.VideoCapture(video_path)
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            f_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            f_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            
+            raw_frames = []
+            frame_idx = 0
 
-    if st.button("🚀 フォーム診断を実行", type="primary"):
-        progress_bar = st.progress(0)
-        status_text = st.empty()
+            while cap.isOpened():
+                ret, frame = cap.read()
+                if not ret:
+                    break
 
-        cap = cv2.VideoCapture(video_path)
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        raw_frames = []
-        f_idx = 0
-
-        while cap.isOpened():
-            ret, frame = cap.read()
-            if not ret: break
-
-            if f_idx % frame_step == 0:
-                h, w, _ = frame.shape
-                results = yolo_model(frame, verbose=False, conf=min_conf)
-                
+                # YOLO推論 (class 0: person)
+                results = model(frame, verbose=False, classes=[0])
                 detections = []
-                for box in results[0].boxes:
-                    if int(box.cls[0]) == 0:
-                        b = box.xyxy[0].cpu().numpy()
+
+                for r in results:
+                    for box in r.boxes:
+                        x1, y1, x2, y2 = box.xyxy[0].tolist()
                         conf = float(box.conf[0])
-                        cx, cy = (b[0] + b[2]) / 2, (b[1] + b[3]) / 2
+                        bw, bh = x2 - x1, y2 - y1
                         
-                        side_margin = w * (side_crop_pct / 100.0)
-                        top_margin = h * (top_crop_pct / 100.0)
-                        is_edge = (b[0] < side_margin) or (b[2] > (w - side_margin)) or (b[1] < top_margin)
+                        # 画面端の誤検出フラグ
+                        is_edge = (x1 < 5 or y1 < 5 or x2 > (f_width - 5) or y2 > (f_height - 5))
 
-                        detections.append({'bbox': b.tolist(), 'center': (cx, cy), 'conf': conf, 'box_height': b[3] - b[1], 'is_edge': is_edge})
+                        detections.append({
+                            'bbox': [x1, y1, x2, y2],
+                            'conf': conf,
+                            'center': ((x1 + x2) / 2.0, (y1 + y2) / 2.0),
+                            'box_height': bh,
+                            'is_edge': is_edge
+                        })
 
-                raw_frames.append({'frame_idx': f_idx, 'frame_height': h, 'frame_width': w, 'detections': detections})
+                raw_frames.append({
+                    'frame_idx': frame_idx,
+                    'frame_height': f_height,
+                    'detections': detections
+                })
+                frame_idx += 1
 
-            f_idx += 1
-            if total_frames > 0:
-                pct = min(1.0, f_idx / total_frames)
-                progress_bar.progress(pct)
-                status_text.text(f"⏳ 動画解析中... {f_idx}/{total_frames} フレーム ({int(pct * 100)}%)")
+            cap.release()
 
-        cap.release()
-        status_text.text("🦴 骨格診断 ＆ 角度評価を実行中...")
-        
-        trajectory = analyze_cheer_motion(video_path, raw_frames, min_peak_conf=min_peak_conf)
+            # --- B. 共通トラッキング＆MediaPipe解析 ---
+            trajectory = analyze_cheer_motion(video_path, raw_frames)
 
-        progress_bar.progress(1.0)
-        status_text.empty()
+            if not trajectory:
+                st.error("⚠️ ジャンプ動作または選手を正常に検出できませんでした。別の動画でお試しください。")
+            else:
+                # --- C. 技ごとのベストフレーム選出 ---
+                peak_data, descent_data = tech_module.select_best_frames(trajectory)
 
-        if not trajectory:
-            st.error("人物または技の動作が検出できませんでした。感度パラメータを調整してみてください。")
-        else:
-            st.success("解析が完了しました！")
-            st.markdown("---")
+                # --- D. 画像のレンダリング（骨格描画） ---
+                peak_img = render_flyer_capture(video_path, peak_data) if peak_data else None
+                descent_img = render_flyer_capture(video_path, descent_data) if descent_data else None
 
-            # 🎯 選択された技専用のモジュールを取得して処理を実行
-            tech_module = TECHNIQUE_MAP[technique_type]
-            peak_data, descent_data = tech_module.select_best_frames(trajectory)
+                # --- E. 結果表示 ---
+                st.subheader("📸 キャプチャ・骨格判定")
+                col1, col2 = st.columns(2)
 
-            # 2列表示
-            col1, col2 = st.columns(2)
+                with col1:
+                    st.markdown("### 🔝 【最高到達点】")
+                    if peak_img is not None:
+                        st.image(peak_img, use_column_width=True)
+                    else:
+                        st.write("最高到達点の画像を取得できませんでした")
 
-            img_peak = render_flyer_capture(video_path, peak_data)
-            with col1:
-                st.subheader("⭐ 1. 最高到達点（最大開脚）")
-                if img_peak is not None:
-                    st.image(img_peak, use_column_width=True)
-                    st.metric("開脚角度 (Split Angle)", f"{peak_data.get('split_angle', 'N/A')} deg")
-                    st.caption(f"検出フレーム: {peak_data['frame_idx']} | 信頼度: {int(peak_data['conf']*100)}%")
+                with col2:
+                    st.markdown("### 🛬 【着地】")
+                    if descent_img is not None:
+                        st.image(descent_img, use_column_width=True)
+                    else:
+                        st.write("着地画像の画像を取得できませんでした")
 
-            img_descent = render_flyer_capture(video_path, descent_data)
-            with col2:
-                card2_title = "📉 2. 高空アーチ（反り姿勢）" if "トス" in technique_type else "📉 2. 高空スナップ（脚閉じ）"
-                st.subheader(card2_title)
-                if img_descent is not None:
-                    st.image(img_descent, use_column_width=True)
-                    st.metric("開脚角度", f"{descent_data.get('split_angle', 'N/A')} deg")
-                    st.metric("体幹角度 (Body Posture)", f"{descent_data.get('posture_angle', 'N/A')} deg")
-                    st.caption(f"検出フレーム: {descent_data['frame_idx']} | 信頼度: {int(descent_data['conf']*100)}%")
+                # --- F. AIフォーム診断レポート表示 ---
+                st.markdown("---")
+                st.subheader("📋 AIフォーム診断レポート")
+                
+                diagnoses = tech_module.generate_diagnosis(peak_data, descent_data)
+                
+                for item in diagnoses:
+                    if item.startswith("###") or item == "---":
+                        st.markdown(item)
+                    elif "💡" in item or "🚨" in item:
+                        st.warning(item)
+                    else:
+                        st.success(item)
 
-            # 📋 専用AIアドバイス
-            st.markdown("---")
-            st.subheader("📋 AIフォーム診断レポート")
-            diagnoses = tech_module.generate_diagnosis(peak_data, descent_data)
-            for diag in diagnoses:
-                st.info(diag)
-
-    if os.path.exists(video_path):
+    # 一時ファイルの削除（クリーンアップ）
+    try:
         os.remove(video_path)
+    except Exception:
+        pass
+
