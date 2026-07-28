@@ -7,14 +7,23 @@ from detector import detect_and_filter_frames
 from cheer_logic import analyze_cheer_flyer_descent, render_flyer_capture
 
 st.set_page_config(layout="wide")
-st.title("🤸‍♀️ チアリーディング 技・姿勢診断AI（MediaPipe ハイブリッド版）")
+st.title("🤸‍♀️ チアリーディング 技・姿勢診断AI")
 
-# ⚙️ サイドバー
-st.sidebar.header("⚙️ 検出パラメータ調整")
+# ⚙️ サイドバー: モード＆スピード調整
+st.sidebar.header("⚡ 処理スピード＆精度設定")
+speed_mode = st.sidebar.select_slider(
+    "解析スピード",
+    options=["爆速（3コマごと）", "標準（2コマごと）", "精細（全コマ）"],
+    value="標準（2コマごと）"
+)
+skip_dict = {"爆速（3コマごと）": 3, "標準（2コマごと）": 2, "精細（全コマ）": 1}
+frame_skip = skip_dict[speed_mode]
+
+st.sidebar.header("⚙️ 検出エリア調整")
 conf_thresh = st.sidebar.slider("AI全体感度 (Conf)", 0.05, 0.50, 0.15, 0.01)
 min_peak_conf = st.sidebar.slider("ピーク検知の最小確信度", 0.20, 0.60, 0.35, 0.05)
 margin_pct = st.sidebar.slider("左右端カット率 (%)", 0, 30, 8, 1) / 100.0
-top_margin_pct = st.sidebar.slider("天井ノイズカット率 (%)", 0, 15, 5, 1) / 100.0
+top_margin_pct = st.sidebar.slider("天井ノイズカット率 (%)", 0, 15, 2, 1) / 100.0
 min_size_pct = st.sidebar.slider("最小人物サイズ (%)", 0.0, 5.0, 1.0, 0.5) / 100.0
 
 uploaded_file = st.file_uploader("演技動画を選択してください", type=["mp4", "mov"])
@@ -27,25 +36,39 @@ if uploaded_file is not None:
     st.video(video_path)
 
     if st.button("🚀 AI解析を開始（YOLO ＋ MediaPipe精密追跡）"):
-        with st.spinner("YOLOv8で高速物体追跡中..."):
-            raw_frames = detect_and_filter_frames(
-                video_path, 
-                conf_threshold=conf_thresh, 
-                margin_ratio=margin_pct, 
-                top_margin_ratio=top_margin_pct
-            )
+        # プログレスバーと進行状況テキストの準備
+        progress_bar = st.progress(0)
+        status_text = st.empty()
 
-        with st.spinner("MediaPipeでつま先＆反りの精密角度計算中..."):
-            flyer_trajectory = analyze_cheer_flyer_descent(
-                video_path,
-                raw_frames, 
-                min_size_ratio=min_size_pct,
-                min_peak_conf=min_peak_conf
-            )
+        def update_progress(progress, current_f, total_f):
+            progress_bar.progress(progress)
+            status_text.text(f"⏳ YOLO動画スキャン中... {int(progress * 100)}% ({current_f}/{total_f} コマ)")
+
+        # YOLOによる人物トラッキング
+        raw_frames = detect_and_filter_frames(
+            video_path, 
+            conf_threshold=conf_thresh, 
+            margin_ratio=margin_pct, 
+            top_margin_ratio=top_margin_pct,
+            frame_skip=frame_skip,
+            progress_callback=update_progress
+        )
+
+        status_text.text("🧠 MediaPipeでつま先＆体の反りを精密測定中...")
+        
+        # 落下軌道とMediaPipe精密測定
+        flyer_trajectory = analyze_cheer_flyer_descent(
+            video_path,
+            raw_frames, 
+            min_size_ratio=min_size_pct,
+            min_peak_conf=min_peak_conf
+        )
+
+        # 完了表示
+        progress_bar.progress(1.0)
+        status_text.success("🎉 解析が完了しました！")
 
         if flyer_trajectory:
-            st.success(f"解析完了！ {len(flyer_trajectory)} コマの精密骨格データを抽出しました。")
-
             # 3大シャッターチャンスの特定
             peak_data = flyer_trajectory[0] # ⭐ 最高到達点
             
@@ -53,7 +76,7 @@ if uploaded_file is not None:
             valid_splits = [p for p in flyer_trajectory if p['split_angle'] is not None]
             max_split_data = max(valid_splits, key=lambda x: x['split_angle']) if valid_splits else peak_data
 
-            # 🏹 最大反り（アーチ角度が最小 ＝ 一番深いくの字/反りになっている瞬間）
+            # 🏹 最大反り（アーチ角度が最小 ＝ 一番深く反っている瞬間）
             valid_arches = [p for p in flyer_trajectory if p['arch_angle'] is not None]
             max_arch_data = min(valid_arches, key=lambda x: x['arch_angle']) if valid_arches else peak_data
 
@@ -100,7 +123,7 @@ if uploaded_file is not None:
             st.dataframe(df, use_container_width=True)
 
         else:
-            st.warning("フライヤーの最高到達点が検知できませんでした。")
+            st.warning("フライヤーの最高到達点が検知できませんでした。サイドバーで「天井ノイズカット率」を下げるか、「ピーク検知の最小確信度」を下げて再試行してください。")
 
         if os.path.exists(video_path):
             os.remove(video_path)
