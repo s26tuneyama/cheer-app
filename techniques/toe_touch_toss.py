@@ -69,7 +69,7 @@ def select_best_frames(trajectory):
 
 def generate_diagnosis(f1, f2, f3, f4, trajectory=None):
     """
-    スナップ速度とフォームのAI判定・レポート出力
+    スナップ速度・引き上げスピード・フォームのAI総合判定・レポート出力
     """
     improvements = []
     good_points = []
@@ -80,14 +80,31 @@ def generate_diagnosis(f1, f2, f3, f4, trajectory=None):
         w, h = b[2] - b[0], b[3] - b[1]
         return w / max(1.0, h)
 
-    # 1. 空中初期
-    if f1:
-        good_points.append(f"✨ **【① 空中初期】(Frame {f1['frame_idx']})**: スムーズに踏み切って浮上を開始できています！")
+    # 1. 空中初期：立ち上がりの縦の伸び率（引き上げスピード）評価
+    if f1 and trajectory:
+        # f1より前（離空直前〜離空直後）のフレームを抽出
+        prev_frames = [d for d in trajectory if d['frame_idx'] < f1['frame_idx']]
+        
+        if prev_frames:
+            # 2〜4フレーム前程度の直近コマを取得
+            prev_data = max(prev_frames, key=lambda d: d['frame_idx'])
+            dt = f1['frame_idx'] - prev_data['frame_idx']
+            # Y座標は上に行くほど数値が小さくなるため (prev_Y - f1_Y) がプラスの上昇量
+            dy = prev_data['center'][1] - f1['center'][1]
+            upward_speed = dy / max(1, dt)  # 1フレームあたりの上昇ピクセル数
+
+            # 速度判定（一般的な検出BBoxサイズに対する上昇割合）
+            if upward_speed >= 8.0:
+                good_points.append(f"✨ **【① トップの引き上げ】(Frame {f1['frame_idx']})**: 離空直後の縦への立ち上がりが非常に速く、鋭い引き上げができています！（上昇速度: {upward_speed:.1f} px/f）")
+            else:
+                improvements.append(f"💡 **【① トップの引き上げ】(Frame {f1['frame_idx']})**: 離空直後の立ち上がり（引き上げ）をより鋭く素早く意識すると、さらに高さを出せます！（上昇速度: {upward_speed:.1f} px/f）")
+        else:
+            good_points.append(f"✨ **【① 空中初期】(Frame {f1['frame_idx']})**: スムーズに離空して浮上を開始できています！")
 
     # 2. 開脚スナップ速度（②から③にかかったフレーム数）
     if f2 and f3:
         frame_diff = f3['frame_idx'] - f2['frame_idx']
-        if frame_diff <= 6:
+        if frame_diff <= 8:
             good_points.append(f"✨ **【② 開脚スナップ】(Frame {f2['frame_idx']} → {f3['frame_idx']})**: 脚を閉じた状態からわずか {frame_diff} コマで瞬時に開脚できており、素晴らしい爆発力です！")
         else:
             improvements.append(f"💡 **【② 開脚スナップ】(Frame {f2['frame_idx']} → {f3['frame_idx']})**: 開脚完了までに {frame_diff} コマかかっています。ギリギリまで足を閉じて一気にパッと開くスナップを意識しましょう！")
