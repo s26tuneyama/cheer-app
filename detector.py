@@ -2,18 +2,17 @@
 import cv2
 from ultralytics import YOLO
 
-def detect_and_filter_frames(video_path, conf_threshold=0.15, margin_ratio=0.10, top_margin_ratio=0.02, frame_skip=2):
+def detect_and_filter_frames(video_path, conf_threshold=0.15, margin_ratio=0.10, top_margin_ratio=0.02, frame_skip=2, progress_callback=None):
     """
-    CPU環境向けに最適化したYOLO高速検出処理
-    - yolov8n-pose (Nanoモデル) を使用して爆速化
-    - frame_skip=2 で2コマに1コマ処理して処理時間を半減
+    スピード調整（frame_skip）とリアルタイム進捗表示に対応したYOLO検出処理
     """
-    # 最軽量のNanoモデルを採用 (CPUで超高速に動作)
+    # CPU環境に最適な最軽量モデル (速度重視)
     model = YOLO('yolov8n-pose.pt')
     cap = cv2.VideoCapture(video_path)
     
     frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     
     left_bound = frame_width * margin_ratio
     right_bound = frame_width * (1.0 - margin_ratio)
@@ -27,9 +26,8 @@ def detect_and_filter_frames(video_path, conf_threshold=0.15, margin_ratio=0.10,
         if not ret: 
             break
         
-        # 間引き処理（指定コマ数ごとに解析を実施）
+        # 設定されたコマ間引き（frame_skip）で処理を実行
         if frame_idx % frame_skip == 0:
-            # imgsz=480 でCPUの負担を大幅低減
             results = model.predict(frame, classes=[0], conf=conf_threshold, imgsz=480, verbose=False)
             
             detections = []
@@ -58,6 +56,11 @@ def detect_and_filter_frames(video_path, conf_threshold=0.15, margin_ratio=0.10,
                 'detections': detections,
                 'frame_height': frame_height
             })
+
+        # 進捗状況を画面（Streamlit）へ通知
+        if progress_callback and total_frames > 0:
+            progress = min(1.0, (frame_idx + 1) / total_frames)
+            progress_callback(progress, frame_idx, total_frames)
             
         frame_idx += 1
         
