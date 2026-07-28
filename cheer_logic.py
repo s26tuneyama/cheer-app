@@ -1,9 +1,15 @@
-# cheer_logic.py
 import cv2
 import numpy as np
 import mediapipe as mp
 
-mp_pose = mp.solutions.pose
+# ★ Streamlit Cloud等の環境差異によるMediaPipeインポートエラー対策
+try:
+    from mediapipe.solutions import pose as mp_pose
+except (ImportError, AttributeError):
+    try:
+        from mediapipe.python.solutions import pose as mp_pose
+    except (ImportError, AttributeError):
+        import mediapipe.python.solutions.pose as mp_pose
 
 def calculate_angle(a, b, c):
     a, b, c = np.array(a[:2]), np.array(b[:2]), np.array(c[:2])
