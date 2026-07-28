@@ -115,18 +115,21 @@ if uploaded_file is not None:
             peak_data = trajectory[0]
             peak_f_idx = peak_data['frame_idx']
             
-            # ★ 高空域（ピーク直後 3〜12コマ以内）のみに候補を限定
+            # ★ 高空域（ピーク直後 2〜12コマ以内）のみに候補を限定
             high_altitude_window = [
                 d for d in trajectory 
-                if (peak_f_idx + 3) <= d['frame_idx'] <= (peak_f_idx + 12)
+                if (peak_f_idx + 2) <= d['frame_idx'] <= (peak_f_idx + 12)
             ]
 
             if high_altitude_window:
-                valid_splits = [d for d in high_altitude_window if d.get('split_angle') is not None]
-                if valid_splits:
-                    descent_data = min(valid_splits, key=lambda x: x['split_angle'])
-                else:
-                    descent_data = high_altitude_window[0]
+                # ★ アスペクト比（横幅 / 縦幅）が「最も小さい＝最も縦長（脚閉じ）」のコマを採用！
+                def get_aspect_ratio(det):
+                    b = det['bbox']
+                    w = b[2] - b[0]
+                    h = b[3] - b[1]
+                    return w / h if h > 0 else 999.0
+
+                descent_data = min(high_altitude_window, key=get_aspect_ratio)
             else:
                 fallback_candidates = [d for d in trajectory if d['frame_idx'] > peak_f_idx]
                 descent_data = fallback_candidates[0] if fallback_candidates else peak_data
