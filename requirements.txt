@@ -1,6 +1,6 @@
 streamlit
 ultralytics
-mediapipe
+mediapipe==0.10.21
 opencv-python-headless
 pandas
 numpy
