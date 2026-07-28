@@ -8,14 +8,12 @@ def select_best_frames(trajectory):
     peak_data = trajectory[0]
     peak_f_idx = peak_data['frame_idx']
     
-    # ピーク直後（2〜12コマ以内）の高空〜着地移行域
     high_altitude_window = [
         d for d in trajectory 
         if (peak_f_idx + 2) <= d['frame_idx'] <= (peak_f_idx + 12)
     ]
 
     if high_altitude_window:
-        # 着地に向けて脚をピタッと閉じると、縦長（アスペクト比 w/h が最小）になる
         def get_aspect_ratio(det):
             b = det['bbox']
             w, h = b[2] - b[0], b[3] - b[1]
@@ -30,56 +28,70 @@ def select_best_frames(trajectory):
 
 
 def generate_diagnosis(peak_data, descent_data):
-    """トータッチ・ジャンプ専用 AIアドバイス（ご指定の判定基準）"""
-    diagnoses = []
+    """トータッチ・ジャンプ専用 AIアドバイス（ダメな要素先頭＆見出し明確化）"""
     
+    improvements = []  # 要改善点（💡）
+    good_points = []   # 良好点（✨）
+
     # -------------------------------------------------------------
-    # 1. 最高到達点の姿勢について
+    # 1. 【最高到達点】の評価
     # -------------------------------------------------------------
     
-    # ① 開脚角度の判定
+    # ① 開脚角度 (90度基準)
     split_angle = peak_data.get('split_angle')
     if split_angle is not None:
-        if split_angle >= 90:
-            diagnoses.append("✨ **開脚角度**: 開脚角度は良好です！")
+        if split_angle < 90:
+            improvements.append("💡 **【最高到達点】開脚角度**: 開脚角度を上げましょう")
         else:
-            diagnoses.append("💡 **開脚角度**: 開脚角度を上げましょう")
-    else:
-        diagnoses.append("⚠️ **開脚角度**: 骨格が検出できませんでした。")
+            good_points.append("✨ **【最高到達点】開脚角度**: 開脚角度は良好です！")
 
-    # ② つま先の伸び判定 (toe_extended: 膝-足首-つま先の角度が直線に近いか)
+    # ② つま先
     toe_extended = peak_data.get('toe_extended')
     if toe_extended is True:
-        diagnoses.append("✨ **つま先**: つま先が伸びています！")
-    elif toe_extended is False:
-        diagnoses.append("💡 **つま先**: つま先を伸ばしましょう")
+        good_points.append("✨ **【最高到達点】つま先**: つま先が伸びています！")
     else:
-        diagnoses.append("💡 **つま先**: つま先をしっかり伸ばす意識を持ちましょう。")
+        improvements.append("💡 **【最高到達点】つま先**: つま先を伸ばしましょう")
 
-    # ③ 上体の倒れ判定 (posture_angle: 130度未満だと倒れすぎ)
+    # ③ 上体
     posture_angle = peak_data.get('posture_angle')
-    if posture_angle is not None:
-        if posture_angle < 130:
-            diagnoses.append("💡 **上体の姿勢**: 上体を起こしましょう")
-        else:
-            diagnoses.append("✨ **上体の姿勢**: 上体がしっかり起こせています！")
+    if posture_angle is not None and posture_angle < 130:
+        improvements.append("💡 **【最高到達点】上体**: 上体を起こしましょう")
     else:
-        diagnoses.append("✨ **上体の姿勢**: 上体がしっかり起こせています！")
+        good_points.append("✨ **【最高到達点】上体**: 上体がしっかり起こせています！")
+
+    # ④ 左右対称性
+    leg_symmetry = peak_data.get('leg_symmetry')
+    if leg_symmetry is False:
+        improvements.append("💡 **【最高到達点】左右差**: 脚の上がり方の左右差があります")
+    else:
+        good_points.append("✨ **【最高到達点】左右差**: 脚の上がり方は対称です！")
 
     # -------------------------------------------------------------
-    # 2. 着地（スナップコマ）について
+    # 2. 【着地】の評価
     # -------------------------------------------------------------
     
-    # ④ かかと（着地の足）が閉じているか判定
-    # descent_data での開脚角度が小さい (例: 40度以下) か、足の横幅が十分に狭い場合
     descent_split = descent_data.get('split_angle')
     feet_closed = descent_data.get('feet_closed')
     
-    # 開脚角度が小さい、または足間隔が閉じているか
     if (descent_split is not None and descent_split <= 40) or feet_closed is True:
-        diagnoses.append("✨ **着地**: 着地の足は閉じられています！")
+        good_points.append("✨ **【着地】足閉じ**: 着地の足は閉じられています！")
     else:
-        diagnoses.append("💡 **着地**: 着地の足を閉じましょう")
+        improvements.append("💡 **【着地】足閉じ**: 着地の足を閉じましょう")
+
+    # -------------------------------------------------------------
+    # グループ化して返却（改善点を一番上へ！）
+    # -------------------------------------------------------------
+    diagnoses = []
+    
+    if improvements:
+        diagnoses.append("### 🚨 修正・改善ポイント")
+        diagnoses.extend(improvements)
+        
+    if good_points:
+        if improvements:
+            diagnoses.append("---")
+        diagnoses.append("### 🎯 ナイスポイント（Good!）")
+        diagnoses.extend(good_points)
 
     return diagnoses
 
