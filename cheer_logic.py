@@ -18,7 +18,7 @@ def calculate_angle(a, b, c):
 
 def extract_mediapipe_angles(frame, bbox, pose_estimator):
     """
-    180度開脚やつま先を逃さない広範囲クロップ ＋ 「腰の位置（Hip Y）」の正確な測定
+    180度開脚やつま先を逃さない広範囲クロップ ＋ 「足先・足首の高さ（Ankle Y）」の測定
     """
     h_orig, w_orig, _ = frame.shape
     x1, y1, x2, y2 = map(int, bbox)
@@ -35,13 +35,13 @@ def extract_mediapipe_angles(frame, bbox, pose_estimator):
     
     crop = frame[cy1:cy2, cx1:cx2]
     if crop.size == 0:
-        return {'split_angle': None, 'arch_angle': None, 'mp_kpts': {}, 'full_bbox': bbox, 'hip_y': (y1 + y2) / 2}
+        return {'split_angle': None, 'arch_angle': None, 'mp_kpts': {}, 'full_bbox': bbox, 'ankle_y': (y1 + y2) / 2}
 
     crop_rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
     results = pose_estimator.process(crop_rgb)
     
     if not results.pose_landmarks:
-        return {'split_angle': None, 'arch_angle': None, 'mp_kpts': {}, 'full_bbox': bbox, 'hip_y': (y1 + y2) / 2}
+        return {'split_angle': None, 'arch_angle': None, 'mp_kpts': {}, 'full_bbox': bbox, 'ankle_y': (y1 + y2) / 2}
 
     landmarks = results.pose_landmarks.landmark
     kpts = {}
@@ -56,22 +56,30 @@ def extract_mediapipe_angles(frame, bbox, pose_estimator):
             x_coords.append(abs_x)
             y_coords.append(abs_y)
 
-    # 1. 腰の高さ（Hip Center Y座標）を算出 ➔ 本当の最高到達点の判定に使用
+    # 1. 腰の検出
     hip_center = None
-    hip_y = (y1 + y2) / 2.0  # デフォルト値
     if 23 in kpts and 24 in kpts:
         hip_center = [(kpts[23][0] + kpts[24][0])/2, (kpts[23][1] + kpts[24][1])/2]
-        hip_y = hip_center[1]
 
-    # 2. 最大開脚角度（左足 - 腰 - 右足）
+    # 2. 足首/つま先の高さ（Ankle/Toe Y座標）算出 ➔ チアジャンプの「最高到達点」の真の基準！
+    left_foot = kpts.get(31, kpts.get(27)) # 31=つま先, 27=足首
+    right_foot = kpts.get(32, kpts.get(28)) # 32=つま先, 28=足首
+
+    if left_foot and right_foot:
+        ankle_y = (left_foot[1] + right_foot[1]) / 2.0
+    elif left_foot:
+        ankle_y = left_foot[1]
+    elif right_foot:
+        ankle_y = right_foot[1]
+    else:
+        ankle_y = (y1 + y2) / 2.0
+
+    # 3. 最大開脚角度（左足 - 腰 - 右足）
     split_angle = None
-    left_foot = kpts.get(31, kpts.get(27))
-    right_foot = kpts.get(32, kpts.get(28))
-
     if hip_center and left_foot and right_foot:
         split_angle = calculate_angle(left_foot, hip_center, right_foot)
 
-    # 3. 体の反り角度（Arch）
+    # 4. 体の反り角度（Arch）
     arch_angle = None
     if split_angle is None or split_angle < 45.0:
         shoulder_center = None
@@ -100,7 +108,7 @@ def extract_mediapipe_angles(frame, bbox, pose_estimator):
         'arch_angle': arch_angle,
         'mp_kpts': kpts,
         'full_bbox': full_bbox,
-        'hip_y': hip_y
+        'ankle_y': ankle_y
     }
 
 def analyze_cheer_flyer_descent(video_path, raw_frames, max_jump_distance=180.0, min_size_ratio=0.01, min_peak_conf=0.20):
@@ -122,39 +130,35 @@ def analyze_cheer_flyer_descent(video_path, raw_frames, max_jump_distance=180.0,
     if not candidates:
         return []
 
-    # 画面上部にある人物候補を優先してスキャン
     candidates.sort(key=lambda x: x['center'][1])
 
     cap = cv2.VideoCapture(video_path)
     valid_flyer_candidates = []
 
-    # 上位候補のMediaPipe骨格データと「腰の高さ（hip_y）」を収集
     with mp_pose.Pose(static_image_mode=True, model_complexity=1, min_detection_confidence=0.3) as pose:
-        for cand in candidates[:15]: # 高い位置にある上位15個の候補を解析
+        for cand in candidates[:20]: # 確実な判定のためにスキャン範囲を拡大
             cap.set(cv2.CAP_PROP_POS_FRAMES, cand['frame_idx'])
             ret, frame = cap.read()
             if not ret or frame is None: continue
 
             mp_res = extract_mediapipe_angles(frame, cand['bbox'], pose)
             
-            # 人間（骨格）が取れているものだけを抽出
             if len(mp_res.get('mp_kpts', {})) >= 5:
                 cand_data = cand.copy()
                 cand_data['split_angle'] = mp_res['split_angle']
                 cand_data['arch_angle'] = mp_res['arch_angle']
                 cand_data['mp_kpts'] = mp_res['mp_kpts']
                 cand_data['full_bbox'] = mp_res['full_bbox']
-                cand_data['hip_y'] = mp_res['hip_y']
+                cand_data['ankle_y'] = mp_res['ankle_y']
                 valid_flyer_candidates.append(cand_data)
 
         if not valid_flyer_candidates:
             cap.release()
             return []
 
-        # ★ 決定打：「枠の中心」ではなく「腰の位置（hip_y）」が一番高い（数値が一番小さい）ものを真のピーク（最高到達点）に設定！
-        peak_detection = min(valid_flyer_candidates, key=lambda x: x['hip_y'])
+        # ★ 決定打：「足首/つま先（ankle_y）」が画面上で一番高くなった（Y数値が一番小さい）瞬間を最高到達点（ピーク）に設定！
+        peak_detection = min(valid_flyer_candidates, key=lambda x: x['ankle_y'])
 
-        # ピーク以降の下降軌道を追跡
         peak_frame_idx = peak_detection['frame_idx']
         trajectory = [peak_detection]
         prev_center = peak_detection['center']
@@ -182,7 +186,7 @@ def analyze_cheer_flyer_descent(video_path, raw_frames, max_jump_distance=180.0,
                 tracked_flyer['arch_angle'] = mp_res['arch_angle']
                 tracked_flyer['mp_kpts'] = mp_res['mp_kpts']
                 tracked_flyer['full_bbox'] = mp_res['full_bbox']
-                tracked_flyer['hip_y'] = mp_res['hip_y']
+                tracked_flyer['ankle_y'] = mp_res['ankle_y']
                 trajectory.append(tracked_flyer)
                 prev_center = tracked_flyer['center']
 
