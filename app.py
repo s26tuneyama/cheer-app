@@ -3,20 +3,24 @@ import streamlit as st
 import cv2
 import tempfile
 import os
-from cheer_logic import analyze_cheer_motion, render_flyer_capture, generate_diagnosis
 from ultralytics import YOLO
+
+from cheer_core import analyze_cheer_motion, render_flyer_capture
+from techniques import toe_touch_toss, toe_touch_jump
 
 st.set_page_config(page_title="Cheer Form Analyzer", layout="wide")
 
 st.title("📣 チアリーディング フォーム＆技診断 AI")
-st.caption("AIが技の最高到達点と高空スナップ姿勢を検出し、骨格に基づいたアドバイスを自動生成します。")
+st.caption("技ごとの特性（トスの反り / ジャンプの縦伸び）に合わせた専用ロジックで自動解析します。")
 
-# --- サイドバー設定 ---
+# 技の定義とモジュールのマッピング
+TECHNIQUE_MAP = {
+    "トータッチ・トス（フライヤー）": toe_touch_toss,
+    "トータッチ・ジャンプ（ソロ）": toe_touch_jump
+}
+
 st.sidebar.markdown("### 🎯 技の選択")
-technique_type = st.sidebar.selectbox(
-    "解析する技の種類を選択",
-    ["トータッチ・トス（フライヤー）", "トータッチ・ジャンプ（ソロ）"]
-)
+technique_type = st.sidebar.selectbox("解析する技の種類を選択", list(TECHNIQUE_MAP.keys()))
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("### ⚡ 処理スピード & 精度設定")
@@ -72,7 +76,7 @@ if uploaded_file is not None:
                 
                 detections = []
                 for box in results[0].boxes:
-                    if int(box.cls[0]) == 0:  # 人間
+                    if int(box.cls[0]) == 0:
                         b = box.xyxy[0].cpu().numpy()
                         conf = float(box.conf[0])
                         cx, cy = (b[0] + b[2]) / 2, (b[1] + b[3]) / 2
@@ -92,15 +96,9 @@ if uploaded_file is not None:
                 status_text.text(f"⏳ 動画解析中... {f_idx}/{total_frames} フレーム ({int(pct * 100)}%)")
 
         cap.release()
-
         status_text.text("🦴 骨格診断 ＆ 角度評価を実行中...")
         
-        trajectory = analyze_cheer_motion(
-            video_path, 
-            raw_frames, 
-            technique_type=technique_type,
-            min_peak_conf=min_peak_conf
-        )
+        trajectory = analyze_cheer_motion(video_path, raw_frames, min_peak_conf=min_peak_conf)
 
         progress_bar.progress(1.0)
         status_text.empty()
@@ -111,28 +109,9 @@ if uploaded_file is not None:
             st.success("解析が完了しました！")
             st.markdown("---")
 
-            # カード選出
-            peak_data = trajectory[0]
-            peak_f_idx = peak_data['frame_idx']
-            
-            # ★ 高空域（ピーク直後 2〜12コマ以内）のみに候補を限定
-            high_altitude_window = [
-                d for d in trajectory 
-                if (peak_f_idx + 2) <= d['frame_idx'] <= (peak_f_idx + 12)
-            ]
-
-            if high_altitude_window:
-                # ★ アスペクト比（横幅 / 縦幅）が「最も小さい＝最も縦長（脚閉じ）」のコマを採用！
-                def get_aspect_ratio(det):
-                    b = det['bbox']
-                    w = b[2] - b[0]
-                    h = b[3] - b[1]
-                    return w / h if h > 0 else 999.0
-
-                descent_data = min(high_altitude_window, key=get_aspect_ratio)
-            else:
-                fallback_candidates = [d for d in trajectory if d['frame_idx'] > peak_f_idx]
-                descent_data = fallback_candidates[0] if fallback_candidates else peak_data
+            # 🎯 選択された技専用のモジュールを取得して処理を実行
+            tech_module = TECHNIQUE_MAP[technique_type]
+            peak_data, descent_data = tech_module.select_best_frames(trajectory)
 
             # 2列表示
             col1, col2 = st.columns(2)
@@ -147,20 +126,20 @@ if uploaded_file is not None:
 
             img_descent = render_flyer_capture(video_path, descent_data)
             with col2:
-                st.subheader("📉 2. 高空スナップ（頂点直後の脚閉じ）")
+                card2_title = "📉 2. 高空アーチ（反り姿勢）" if "トス" in technique_type else "📉 2. 高空スナップ（脚閉じ）"
+                st.subheader(card2_title)
                 if img_descent is not None:
                     st.image(img_descent, use_column_width=True)
-                    st.metric("高空スナップ角度 (Snap Angle)", f"{descent_data.get('split_angle', 'N/A')} deg")
+                    st.metric("開脚角度", f"{descent_data.get('split_angle', 'N/A')} deg")
                     st.metric("体幹角度 (Body Posture)", f"{descent_data.get('posture_angle', 'N/A')} deg")
                     st.caption(f"検出フレーム: {descent_data['frame_idx']} | 信頼度: {int(descent_data['conf']*100)}%")
 
-            # 📋 AI骨格診断フィードバックの表示
+            # 📋 専用AIアドバイス
             st.markdown("---")
             st.subheader("📋 AIフォーム診断レポート")
-            diagnoses = generate_diagnosis(peak_data, descent_data, technique_type)
+            diagnoses = tech_module.generate_diagnosis(peak_data, descent_data)
             for diag in diagnoses:
                 st.info(diag)
 
     if os.path.exists(video_path):
         os.remove(video_path)
-
