@@ -1,15 +1,10 @@
+# cheer_logic.py
 import cv2
 import numpy as np
 import mediapipe as mp
 
-# ★ Streamlit Cloud等の環境差異によるMediaPipeインポートエラー対策
-try:
-    from mediapipe.solutions import pose as mp_pose
-except (ImportError, AttributeError):
-    try:
-        from mediapipe.python.solutions import pose as mp_pose
-    except (ImportError, AttributeError):
-        import mediapipe.python.solutions.pose as mp_pose
+# MediaPipe Poseモジュールの読み込み
+mp_pose = mp.solutions.pose
 
 def calculate_angle(a, b, c):
     a, b, c = np.array(a[:2]), np.array(b[:2]), np.array(c[:2])
@@ -58,7 +53,7 @@ def extract_mediapipe_angles(frame, bbox):
                 abs_y = int(lm.y * crop_h + cy1)
                 kpts[idx] = [abs_x, abs_y, lm.visibility]
 
-        # 1. つま先を含めた開脚角度（11/12腰中点 - 31/32つま先）
+        # 1. つま先を含めた開脚角度（23/24腰中点 - 31/32つま先）
         split_angle = None
         hip_center = None
         if 23 in kpts and 24 in kpts:
