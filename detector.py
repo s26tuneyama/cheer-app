@@ -3,10 +3,6 @@ import cv2
 from ultralytics import YOLO
 
 def detect_and_filter_frames(video_path, conf_threshold=0.15, margin_ratio=0.10, top_margin_ratio=0.02):
-    """
-    yolov8m-pose (Mediumモデル) を使用して高精度に骨格推定
-    """
-    # ★ 高精度な Medium モデルに変更
     model = YOLO('yolov8m-pose.pt')
     cap = cv2.VideoCapture(video_path)
     
@@ -25,7 +21,8 @@ def detect_and_filter_frames(video_path, conf_threshold=0.15, margin_ratio=0.10,
         if not ret: 
             break
         
-        results = model.predict(frame, classes=[0], conf=conf_threshold, verbose=False)
+        # ★ imgsz=960 を指定して高解像度のまま骨格を捉える（メモリ増加は最小限）
+        results = model.predict(frame, classes=[0], conf=conf_threshold, imgsz=960, verbose=False)
         
         detections = []
         if len(results[0].boxes) > 0:
@@ -47,7 +44,6 @@ def detect_and_filter_frames(video_path, conf_threshold=0.15, margin_ratio=0.10,
                 
                 is_edge = not (left_bound <= x_center <= right_bound) or (y_center < top_bound)
                 
-                # 関節データ [x, y, conf] のリストを作成
                 kpts_data = []
                 if i < len(kpts_xy):
                     for j in range(len(kpts_xy[i])):
