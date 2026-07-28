@@ -1,11 +1,9 @@
 # cheer_logic.py
-import numpy as np
 import cv2
+import numpy as np
+import mediapipe as mp
 
-SKELETON_CONNECTIONS = [
-    (5, 6), (5, 7), (7, 9), (6, 8), (8, 10),
-    (5, 11), (6, 12), (11, 12), (11, 13), (13, 15), (12, 14), (14, 16)
-]
+mp_pose = mp.solutions.pose
 
 def calculate_angle(a, b, c):
     a, b, c = np.array(a[:2]), np.array(b[:2]), np.array(c[:2])
@@ -18,71 +16,77 @@ def calculate_angle(a, b, c):
     cosine_angle = np.clip(np.dot(ba, bc) / (norm_ba * norm_bc), -1.0, 1.0)
     return float(np.degrees(np.arccos(cosine_angle)))
 
-def extract_cheer_angles(keypoints, kpt_conf_thresh=0.25):
-    if not keypoints or len(keypoints) < 17:
-        return {'body_angle': None, 'split_angle': None}
-    
-    def valid_pt(pt_idx):
-        if pt_idx >= len(keypoints): return False
-        pt = keypoints[pt_idx]
-        conf = pt[2] if len(pt) > 2 else 1.0
-        return (pt[0] > 0 and pt[1] > 0 and conf >= kpt_conf_thresh)
-
-    body_angle = None
-    if valid_pt(5) and valid_pt(6) and valid_pt(11) and valid_pt(12):
-        shoulder_mid = [(keypoints[5][0] + keypoints[6][0]) / 2, (keypoints[5][1] + keypoints[6][1]) / 2]
-        hip_mid = [(keypoints[11][0] + keypoints[12][0]) / 2, (keypoints[11][1] + keypoints[12][1]) / 2]
-        
-        knee_pt = None
-        if valid_pt(13) and valid_pt(14):
-            knee_pt = [(keypoints[13][0] + keypoints[14][0]) / 2, (keypoints[13][1] + keypoints[14][1]) / 2]
-        elif valid_pt(13): knee_pt = keypoints[13]
-        elif valid_pt(14): knee_pt = keypoints[14]
-
-        if knee_pt is not None:
-            body_angle = calculate_angle(shoulder_mid, hip_mid, knee_pt)
-
-    split_angle = None
-    if valid_pt(11) and valid_pt(12) and valid_pt(15) and valid_pt(16):
-        hip_mid = [(keypoints[11][0] + keypoints[12][0]) / 2, (keypoints[11][1] + keypoints[12][1]) / 2]
-        split_angle = calculate_angle(keypoints[15], hip_mid, keypoints[16])
-
-    return {
-        'body_angle': round(body_angle, 1) if body_angle is not None else None,
-        'split_angle': round(split_angle, 1) if split_angle is not None else None
-    }
-
-def smooth_angles_median(trajectory, window_size=3):
+def extract_mediapipe_angles(frame, bbox):
     """
-    【安全策】座標は触らず、算出された「角度数値」に対して
-    前後コマの中央値（メディアン）をとって一瞬の誤認識スパイクだけを弾く
+    フライヤー周辺をクロップし、MediaPipe Poseで33箇所のキーポイント（つま先含む）を取得
     """
-    if len(trajectory) < window_size:
-        return trajectory
-
-    num_frames = len(trajectory)
+    h_orig, w_orig, _ = frame.shape
+    x1, y1, x2, y2 = map(int, bbox)
     
-    # 開脚角度の平滑化
-    split_angles = [pt.get('split_angle') for pt in trajectory]
-    body_angles = [pt.get('body_angle') for pt in trajectory]
+    # 周辺を30%余白を持って切り抜き
+    pad_w = int((x2 - x1) * 0.3)
+    pad_h = int((y2 - y1) * 0.3)
+    cx1, cy1 = max(0, x1 - pad_w), max(0, y1 - pad_h)
+    cx2, cy2 = min(w_orig, x2 + pad_w), min(h_orig, y2 + pad_h)
+    
+    crop = frame[cy1:cy2, cx1:cx2]
+    if crop.size == 0:
+        return {'split_angle': None, 'arch_angle': None, 'mp_kpts': {}}
 
-    for i in range(num_frames):
-        start = max(0, i - window_size // 2)
-        end = min(num_frames, i + window_size // 2 + 1)
+    crop_rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+    
+    with mp_pose.Pose(static_image_mode=True, model_complexity=1, min_detection_confidence=0.3) as pose:
+        results = pose.process(crop_rgb)
         
-        # 開脚角度の中央値
-        valid_splits = [split_angles[k] for k in range(start, end) if split_angles[k] is not None]
-        if valid_splits:
-            trajectory[i]['split_angle'] = round(float(np.median(valid_splits)), 1)
+        if not results.pose_landmarks:
+            return {'split_angle': None, 'arch_angle': None, 'mp_kpts': {}}
 
-        # 体幹角度の中央値
-        valid_bodies = [body_angles[k] for k in range(start, end) if body_angles[k] is not None]
-        if valid_bodies:
-            trajectory[i]['body_angle'] = round(float(np.median(valid_bodies)), 1)
+        landmarks = results.pose_landmarks.landmark
+        
+        # 画面座標系に変換
+        kpts = {}
+        crop_h, crop_w, _ = crop.shape
+        for idx, lm in enumerate(landmarks):
+            if lm.visibility > 0.2:
+                abs_x = int(lm.x * crop_w + cx1)
+                abs_y = int(lm.y * crop_h + cy1)
+                kpts[idx] = [abs_x, abs_y, lm.visibility]
 
-    return trajectory
+        # 1. つま先を含めた開脚角度（11/12腰中点 - 31/32つま先）
+        split_angle = None
+        hip_center = None
+        if 23 in kpts and 24 in kpts:
+            hip_center = [(kpts[23][0] + kpts[24][0])/2, (kpts[23][1] + kpts[24][1])/2]
+        
+        # つま先(31, 32)優先、無ければ足首(27, 28)
+        left_foot = kpts.get(31, kpts.get(27))
+        right_foot = kpts.get(32, kpts.get(28))
 
-def analyze_cheer_flyer_descent(raw_frames, max_jump_distance=180.0, min_size_ratio=0.01, min_peak_conf=0.35):
+        if hip_center and left_foot and right_foot:
+            split_angle = calculate_angle(left_foot, hip_center, right_foot)
+
+        # 2. 体の反り（アーチ）角度（11/12肩中点 - 23/24腰中点 - 27/28足首中点）
+        arch_angle = None
+        shoulder_center = None
+        foot_center = None
+        if 11 in kpts and 12 in kpts:
+            shoulder_center = [(kpts[11][0] + kpts[12][0])/2, (kpts[11][1] + kpts[12][1])/2]
+        if 27 in kpts and 28 in kpts:
+            foot_center = [(kpts[27][0] + kpts[28][0])/2, (kpts[27][1] + kpts[28][1])/2]
+
+        if shoulder_center and hip_center and foot_center:
+            arch_angle = calculate_angle(shoulder_center, hip_center, foot_center)
+
+        return {
+            'split_angle': round(split_angle, 1) if split_angle else None,
+            'arch_angle': round(arch_angle, 1) if arch_angle else None,
+            'mp_kpts': kpts
+        }
+
+def analyze_cheer_flyer_descent(video_path, raw_frames, max_jump_distance=180.0, min_size_ratio=0.01, min_peak_conf=0.35):
+    """
+    YOLOでフライヤーの軌道を特定し、軌道内の全コマにMediaPipeを適用して精密測定
+    """
     peak_frame_idx = -1
     min_y = float('inf')
     peak_detection = None
@@ -106,49 +110,45 @@ def analyze_cheer_flyer_descent(raw_frames, max_jump_distance=180.0, min_size_ra
     if peak_detection is None:
         return []
 
+    # 動画を開いて該当コマの画像を取得しながらMediaPipe解析
+    cap = cv2.VideoCapture(video_path)
     trajectory = []
+    
     current_target = peak_detection.copy()
     current_target['frame_idx'] = peak_frame_idx
-    current_target['valid_for_scoring'] = current_target['conf'] >= 0.35
-    
-    angles = extract_cheer_angles(current_target.get('keypoints'))
-    current_target['body_angle'] = angles['body_angle']
-    current_target['split_angle'] = angles['split_angle']
-    trajectory.append(current_target)
     prev_center = current_target['center']
 
-    for frame_info in raw_frames[peak_frame_idx + 1:]:
+    # 最高到達点からの落下軌道をトラッキング
+    for frame_info in raw_frames[peak_frame_idx:]:
         f_idx = frame_info['frame_idx']
-        candidates = [d for d in frame_info['detections'] if not d['is_edge']]
-        if not candidates: break
+        
+        # ピークコマは判定済み、以降は距離が一番近いものを採用
+        if f_idx == peak_frame_idx:
+            best_cand = current_target
+        else:
+            candidates = [d for d in frame_info['detections'] if not d['is_edge']]
+            if not candidates: break
+            best_cand = min(candidates, key=lambda c: np.sqrt((c['center'][0]-prev_center[0])**2 + (c['center'][1]-prev_center[1])**2))
+            if np.sqrt((best_cand['center'][0]-prev_center[0])**2 + (best_cand['center'][1]-prev_center[1])**2) > max_jump_distance:
+                break
 
-        best_candidate = None
-        min_dist = float('inf')
-
-        for cand in candidates:
-            dist = np.sqrt((cand['center'][0] - prev_center[0])**2 + (cand['center'][1] - prev_center[1])**2)
-            if dist < min_dist:
-                min_dist = dist
-                best_candidate = cand
-
-        if best_candidate and min_dist <= max_jump_distance:
-            tracked_flyer = best_candidate.copy()
+        # コマ画像の読み込みとMediaPipe解析
+        cap.set(cv2.CAP_PROP_POS_FRAMES, f_idx)
+        ret, frame = cap.read()
+        if ret and frame is not None:
+            mp_res = extract_mediapipe_angles(frame, best_cand['bbox'])
+            tracked_flyer = best_cand.copy()
             tracked_flyer['frame_idx'] = f_idx
-            tracked_flyer['valid_for_scoring'] = tracked_flyer['conf'] >= 0.35
-            angles = extract_cheer_angles(tracked_flyer.get('keypoints'))
-            tracked_flyer['body_angle'] = angles['body_angle']
-            tracked_flyer['split_angle'] = angles['split_angle']
+            tracked_flyer['split_angle'] = mp_res['split_angle']
+            tracked_flyer['arch_angle'] = mp_res['arch_angle']
+            tracked_flyer['mp_kpts'] = mp_res['mp_kpts']
             trajectory.append(tracked_flyer)
             prev_center = tracked_flyer['center']
-        else:
-            break
 
-    # ★ 角度の数値に対してメディアンフィルタを適用（歪み・誤判定の完全排除）
-    trajectory = smooth_angles_median(trajectory, window_size=3)
-
+    cap.release()
     return trajectory
 
-def render_flyer_capture(video_path, flyer_data, kpt_conf_thresh=0.20):
+def render_flyer_capture(video_path, flyer_data):
     if not flyer_data: return None
     cap = cv2.VideoCapture(video_path)
     cap.set(cv2.CAP_PROP_POS_FRAMES, flyer_data['frame_idx'])
@@ -156,37 +156,33 @@ def render_flyer_capture(video_path, flyer_data, kpt_conf_thresh=0.20):
     cap.release()
     if not ret or frame is None: return None
 
+    # BBox
     bbox = flyer_data.get('bbox')
     if bbox:
         x1, y1, x2, y2 = map(int, bbox)
         cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 255), 2)
 
-    kpts = flyer_data.get('keypoints', [])
-    if kpts and len(kpts) >= 17:
-        for pt in kpts:
-            x, y = int(pt[0]), int(pt[1])
-            conf = pt[2] if len(pt) > 2 else 1.0
-            if x > 0 and y > 0 and conf >= kpt_conf_thresh:
-                cv2.circle(frame, (x, y), 5, (0, 0, 255), -1)
+    # MediaPipe キーポイント描画（つま先までプロット）
+    kpts = flyer_data.get('mp_kpts', {})
+    for idx, pt in kpts.items():
+        cv2.circle(frame, (pt[0], pt[1]), 4, (0, 0, 255), -1)
 
-        for p1_idx, p2_idx in SKELETON_CONNECTIONS:
-            pt1, pt2 = kpts[p1_idx], kpts[p2_idx]
-            conf1 = pt1[2] if len(pt1) > 2 else 1.0
-            conf2 = pt2[2] if len(pt2) > 2 else 1.0
-            if conf1 >= kpt_conf_thresh and conf2 >= kpt_conf_thresh:
-                x1, y1 = int(pt1[0]), int(pt1[1])
-                x2, y2 = int(pt2[0]), int(pt2[1])
-                if x1 > 0 and y1 > 0 and x2 > 0 and y2 > 0:
-                    cv2.line(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+    # 主な骨格ライン（肩・腰・脚・つま先）
+    connections = [
+        (11, 12), (11, 23), (12, 24), (23, 24),
+        (23, 25), (25, 27), (27, 31), # 左脚 -> つま先
+        (24, 26), (26, 28), (28, 32)  # 右脚 -> つま先
+    ]
+    for p1, p2 in connections:
+        if p1 in kpts and p2 in kpts:
+            cv2.line(frame, (kpts[p1][0], kpts[p1][1]), (kpts[p2][0], kpts[p2][1]), (0, 255, 0), 2)
 
-    info_text = f"Frame: {flyer_data['frame_idx']} | Conf: {int(flyer_data['conf']*100)}%"
-    cv2.putText(frame, info_text, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
-    
-    b_ang = flyer_data.get('body_angle')
     s_ang = flyer_data.get('split_angle')
+    a_ang = flyer_data.get('arch_angle')
     
-    cv2.putText(frame, f"Body: {b_ang if b_ang is not None else 'N/A'} deg", (20, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2, cv2.LINE_AA)
-    cv2.putText(frame, f"Split: {s_ang if s_ang is not None else 'N/A'} deg", (20, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2, cv2.LINE_AA)
+    cv2.putText(frame, f"Frame: {flyer_data['frame_idx']} | Conf: {int(flyer_data['conf']*100)}%", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+    cv2.putText(frame, f"Split (Toe): {s_ang if s_ang is not None else 'N/A'} deg", (20, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+    cv2.putText(frame, f"Arch (Back): {a_ang if a_ang is not None else 'N/A'} deg", (20, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 150, 0), 2)
 
     return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
