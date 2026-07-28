@@ -72,14 +72,14 @@ def extract_mediapipe_angles(frame, bbox, pose_estimator):
     foot_center = [(kpts[27][0] + kpts[28][0])/2, (kpts[27][1] + kpts[28][1])/2] if 27 in kpts and 28 in kpts else None
     posture_angle = calculate_angle(shoulder_center, hip_center, foot_center) if (shoulder_center and hip_center and foot_center) else None
 
-    # 3. つま先の伸ばし判定 (125度以上に緩和！)
+    # 3. つま先の伸ばし判定 (125度以上)
     left_toe_ang = calculate_angle(kpts[25], kpts[27], kpts[31]) if (25 in kpts and 27 in kpts and 31 in kpts) else None
     right_toe_ang = calculate_angle(kpts[26], kpts[28], kpts[32]) if (26 in kpts and 28 in kpts and 32 in kpts) else None
     
     toe_angles = [a for a in [left_toe_ang, right_toe_ang] if a is not None]
     toe_extended = (sum(toe_angles) / len(toe_angles) >= 125) if toe_angles else None
 
-    # 4. 左右対称性（脚の上がり方の差が15度以内か）
+    # 4. 左右対称性
     leg_symmetry = None
     if hip_center and left_foot and right_foot and 23 in kpts and 24 in kpts:
         left_ang = calculate_angle(kpts[24], hip_center, left_foot)
@@ -87,7 +87,7 @@ def extract_mediapipe_angles(frame, bbox, pose_estimator):
         if left_ang is not None and right_ang is not None:
             leg_symmetry = (abs(left_ang - right_ang) <= 15.0)
 
-    # 5. 着地の足閉じ判定
+    # 5. 足閉じ判定
     feet_closed = None
     if 27 in kpts and 28 in kpts and 23 in kpts and 24 in kpts:
         feet_dist = abs(kpts[27][0] - kpts[28][0])
@@ -108,7 +108,7 @@ def extract_mediapipe_angles(frame, bbox, pose_estimator):
     }
 
 def analyze_cheer_motion(video_path, raw_frames, max_jump_distance=350.0, min_size_ratio=0.01, min_peak_conf=0.15):
-    """共通トラッキング処理"""
+    """上昇〜最高到達点〜下降の双方向トラッキング処理"""
     candidates = []
     for frame_info in raw_frames:
         f_idx = frame_info['frame_idx']
@@ -147,13 +147,47 @@ def analyze_cheer_motion(video_path, raw_frames, max_jump_distance=350.0, min_si
             cap.release()
             return []
 
+        # 1. ピーク（最高到達点）フレームの特定
         peak_detection = min(valid_candidates, key=lambda x: x['ankle_y'])
-        trajectory = [peak_detection]
+        peak_idx = peak_detection['frame_idx']
+
+        trajectory_dict = {peak_idx: peak_detection}
+
+        # 2. 上昇局面トラッキング（過去方向へ連鎖追跡）
         prev_center = peak_detection['center']
-
-        descent_frames = [f for f in raw_frames if f['frame_idx'] > peak_detection['frame_idx']]
+        ascent_frames = [f for f in raw_frames if f['frame_idx'] < peak_idx]
+        ascent_frames.sort(key=lambda x: x['frame_idx'], reverse=True)
+        
         missing_count = 0
+        for frame_info in ascent_frames:
+            f_idx = frame_info['frame_idx']
+            valid_dets = [d for d in frame_info['detections'] if not d['is_edge']]
+            close_dets = [d for d in valid_dets if np.sqrt((d['center'][0]-prev_center[0])**2 + (d['center'][1]-prev_center[1])**2) <= max_jump_distance]
 
+            if not close_dets:
+                missing_count += 1
+                if missing_count > 4: break
+                continue
+
+            missing_count = 0
+            best_cand = min(close_dets, key=lambda d: np.sqrt((d['center'][0]-prev_center[0])**2 + (d['center'][1]-prev_center[1])**2))
+
+            cap.set(cv2.CAP_PROP_POS_FRAMES, f_idx)
+            ret, frame = cap.read()
+            if ret and frame is not None:
+                mp_res = extract_mediapipe_angles(frame, best_cand['bbox'], pose)
+                tracked = best_cand.copy()
+                tracked['frame_idx'] = f_idx
+                tracked.update(mp_res)
+                trajectory_dict[f_idx] = tracked
+                prev_center = tracked['center']
+
+        # 3. 下降局面トラッキング（未来方向へ連鎖追跡）
+        prev_center = peak_detection['center']
+        descent_frames = [f for f in raw_frames if f['frame_idx'] > peak_idx]
+        descent_frames.sort(key=lambda x: x['frame_idx'])
+        
+        missing_count = 0
         for frame_info in descent_frames:
             f_idx = frame_info['frame_idx']
             valid_dets = [d for d in frame_info['detections'] if not d['is_edge']]
@@ -174,10 +208,13 @@ def analyze_cheer_motion(video_path, raw_frames, max_jump_distance=350.0, min_si
                 tracked = best_cand.copy()
                 tracked['frame_idx'] = f_idx
                 tracked.update(mp_res)
-                trajectory.append(tracked)
+                trajectory_dict[f_idx] = tracked
                 prev_center = tracked['center']
 
     cap.release()
+    
+    # フレーム順にソートしてリスト化
+    trajectory = [trajectory_dict[k] for k in sorted(trajectory_dict.keys())]
     return trajectory
 
 def render_flyer_capture(video_path, flyer_data):
