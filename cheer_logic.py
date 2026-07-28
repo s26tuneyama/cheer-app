@@ -18,31 +18,26 @@ def calculate_angle(a, b, c):
     return float(np.degrees(np.arccos(cosine_angle)))
 
 def extract_mediapipe_angles(frame, bbox, pose_estimator):
-    """
-    足首最高到達点(ankle_y) ＋ 開脚角度(split_angle) ＋ 姿勢角度(posture_angle)の計測
-    """
+    """MediaPipeによる関節角度の抽出"""
     h_orig, w_orig, _ = frame.shape
     x1, y1, x2, y2 = map(int, bbox)
     
-    bw = x2 - x1
-    bh = y2 - y1
+    bw, bh = x2 - x1, y2 - y1
     max_dim = max(bw, bh)
     
-    pad_w = int(max_dim * 1.2)
-    pad_h = int(max_dim * 1.0)
-    
+    pad_w, pad_h = int(max_dim * 1.2), int(max_dim * 1.0)
     cx1, cy1 = max(0, x1 - pad_w), max(0, y1 - pad_h)
     cx2, cy2 = min(w_orig, x2 + pad_w), min(h_orig, y2 + pad_h)
     
     crop = frame[cy1:cy2, cx1:cx2]
     if crop.size == 0:
-        return {'split_angle': None, 'arch_angle': None, 'mp_kpts': {}, 'full_bbox': bbox, 'ankle_y': (y1 + y2) / 2}
+        return {'split_angle': None, 'posture_angle': None, 'mp_kpts': {}, 'full_bbox': bbox, 'ankle_y': (y1 + y2) / 2}
 
     crop_rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
     results = pose_estimator.process(crop_rgb)
     
     if not results.pose_landmarks:
-        return {'split_angle': None, 'arch_angle': None, 'mp_kpts': {}, 'full_bbox': bbox, 'ankle_y': (y1 + y2) / 2}
+        return {'split_angle': None, 'posture_angle': None, 'mp_kpts': {}, 'full_bbox': bbox, 'ankle_y': (y1 + y2) / 2}
 
     landmarks = results.pose_landmarks.landmark
     kpts = {}
@@ -50,66 +45,48 @@ def extract_mediapipe_angles(frame, bbox, pose_estimator):
     x_coords, y_coords = [], []
 
     for idx, lm in enumerate(landmarks):
-        if lm.visibility > 0.2:
+        if lm.visibility > 0.15:
             abs_x = int(lm.x * crop_w + cx1)
             abs_y = int(lm.y * crop_h + cy1)
             kpts[idx] = [abs_x, abs_y, lm.visibility]
             x_coords.append(abs_x)
             y_coords.append(abs_y)
 
-    # 1. 腰・肩の検出
-    hip_center = None
-    if 23 in kpts and 24 in kpts:
-        hip_center = [(kpts[23][0] + kpts[24][0])/2, (kpts[23][1] + kpts[24][1])/2]
-
-    shoulder_center = None
-    if 11 in kpts and 12 in kpts:
-        shoulder_center = [(kpts[11][0] + kpts[12][0])/2, (kpts[11][1] + kpts[12][1])/2]
-
-    # 2. 足首/つま先の高さ（Ankle Y）
+    # 関節座標の取得
+    hip_center = [(kpts[23][0] + kpts[24][0])/2, (kpts[23][1] + kpts[24][1])/2] if 23 in kpts and 24 in kpts else None
+    shoulder_center = [(kpts[11][0] + kpts[12][0])/2, (kpts[11][1] + kpts[12][1])/2] if 11 in kpts and 12 in kpts else None
+    
     left_foot = kpts.get(31, kpts.get(27))
     right_foot = kpts.get(32, kpts.get(28))
 
+    # 足首/つま先高さ (ankle_y)
     if left_foot and right_foot:
         ankle_y = (left_foot[1] + right_foot[1]) / 2.0
-    elif left_foot:
-        ankle_y = left_foot[1]
-    elif right_foot:
-        ankle_y = right_foot[1]
+    elif left_foot or right_foot:
+        ankle_y = (left_foot or right_foot)[1]
     else:
         ankle_y = (y1 + y2) / 2.0
 
-    # 3. 開脚角度（Split Angle）
-    split_angle = None
-    if hip_center and left_foot and right_foot:
-        split_angle = calculate_angle(left_foot, hip_center, right_foot)
+    # 開脚角度 (Split Angle)
+    split_angle = calculate_angle(left_foot, hip_center, right_foot) if (hip_center and left_foot and right_foot) else None
 
-    # 4. 腰の伸び・姿勢角度（肩-腰-足首）：屈曲（前かがみ）していないか
-    foot_center = None
-    if 27 in kpts and 28 in kpts:
-        foot_center = [(kpts[27][0] + kpts[28][0])/2, (kpts[27][1] + kpts[28][1])/2]
+    # 体幹姿勢角度 (Posture Angle: 肩-腰-足首)
+    foot_center = [(kpts[27][0] + kpts[28][0])/2, (kpts[27][1] + kpts[28][1])/2] if 27 in kpts and 28 in kpts else None
+    posture_angle = calculate_angle(shoulder_center, hip_center, foot_center) if (shoulder_center and hip_center and foot_center) else None
 
-    posture_angle = None
-    if shoulder_center and hip_center and foot_center:
-        posture_angle = calculate_angle(shoulder_center, hip_center, foot_center)
-
-    # 全身を囲むバウンディングボックス
-    if x_coords and y_coords:
-        fx1, fy1 = max(0, min(x_coords) - 15), max(0, min(y_coords) - 15)
-        fx2, fy2 = min(w_orig, max(x_coords) + 15), min(h_orig, max(y_coords) + 15)
-        full_bbox = [fx1, fy1, fx2, fy2]
-    else:
-        full_bbox = bbox
+    # Bounding Box調整
+    full_bbox = [max(0, min(x_coords) - 15), max(0, min(y_coords) - 15), min(w_orig, max(x_coords) + 15), min(h_orig, max(y_coords) + 15)] if (x_coords and y_coords) else bbox
 
     return {
         'split_angle': round(split_angle, 1) if split_angle else None,
-        'arch_angle': round(posture_angle, 1) if posture_angle else None,
+        'posture_angle': round(posture_angle, 1) if posture_angle else None,
         'mp_kpts': kpts,
         'full_bbox': full_bbox,
         'ankle_y': ankle_y
     }
 
-def analyze_cheer_flyer_descent(video_path, raw_frames, max_jump_distance=350.0, min_size_ratio=0.01, min_peak_conf=0.20):
+def analyze_cheer_motion(video_path, raw_frames, technique_type="トータッチ・トス（フライヤー）", max_jump_distance=350.0, min_size_ratio=0.01, min_peak_conf=0.15):
+    """動体追跡 ＆ 軌道計算メインロジック"""
     candidates = []
     for frame_info in raw_frames:
         f_idx = frame_info['frame_idx']
@@ -129,76 +106,96 @@ def analyze_cheer_flyer_descent(video_path, raw_frames, max_jump_distance=350.0,
         return []
 
     candidates.sort(key=lambda x: x['center'][1])
-
     cap = cv2.VideoCapture(video_path)
-    valid_flyer_candidates = []
+    valid_candidates = []
 
-    with mp_pose.Pose(static_image_mode=True, model_complexity=1, min_detection_confidence=0.3) as pose:
-        for cand in candidates[:20]:
+    with mp_pose.Pose(static_image_mode=True, model_complexity=1, min_detection_confidence=0.2) as pose:
+        for cand in candidates[:25]:
             cap.set(cv2.CAP_PROP_POS_FRAMES, cand['frame_idx'])
             ret, frame = cap.read()
             if not ret or frame is None: continue
 
             mp_res = extract_mediapipe_angles(frame, cand['bbox'], pose)
-            
-            if len(mp_res.get('mp_kpts', {})) >= 5:
+            if len(mp_res.get('mp_kpts', {})) >= 4:
                 cand_data = cand.copy()
-                cand_data['split_angle'] = mp_res['split_angle']
-                cand_data['arch_angle'] = mp_res['arch_angle']
-                cand_data['mp_kpts'] = mp_res['mp_kpts']
-                cand_data['full_bbox'] = mp_res['full_bbox']
-                cand_data['ankle_y'] = mp_res['ankle_y']
-                valid_flyer_candidates.append(cand_data)
+                cand_data.update(mp_res)
+                valid_candidates.append(cand_data)
 
-        if not valid_flyer_candidates:
+        if not valid_candidates:
             cap.release()
             return []
 
-        # ★ 決定打：足首・つま先（ankle_y）が最も高い位置に達したコマ＝【最高到達点 兼 最大開脚】
-        peak_detection = min(valid_flyer_candidates, key=lambda x: x['ankle_y'])
-
-        peak_frame_idx = peak_detection['frame_idx']
+        # 最高到達点（つま先位置が一番高いフレーム）
+        peak_detection = min(valid_candidates, key=lambda x: x['ankle_y'])
         trajectory = [peak_detection]
         prev_center = peak_detection['center']
 
-        descent_frames = [f for f in raw_frames if f['frame_idx'] > peak_frame_idx]
+        # 降下追尾
+        descent_frames = [f for f in raw_frames if f['frame_idx'] > peak_detection['frame_idx']]
+        missing_count = 0
 
         for frame_info in descent_frames:
             f_idx = frame_info['frame_idx']
             valid_dets = [d for d in frame_info['detections'] if not d['is_edge']]
-            if not valid_dets: break
-
-            # 落下追尾ルール：近くに候補がある中で「一番上の位置（Y最小）」の人物を選択
-            close_dets = []
-            for d in valid_dets:
-                dist = np.sqrt((d['center'][0]-prev_center[0])**2 + (d['center'][1]-prev_center[1])**2)
-                if dist <= max_jump_distance:
-                    close_dets.append((dist, d))
+            
+            # 最も近い人物を追う（シンプルで標準的な近接トラッキング）
+            close_dets = [d for d in valid_dets if np.sqrt((d['center'][0]-prev_center[0])**2 + (d['center'][1]-prev_center[1])**2) <= max_jump_distance]
 
             if not close_dets:
-                break
+                missing_count += 1
+                if missing_count > 4: break
+                continue
 
-            best_cand = min([item[1] for item in close_dets], key=lambda x: x['center'][1])
+            missing_count = 0
+            best_cand = min(close_dets, key=lambda d: np.sqrt((d['center'][0]-prev_center[0])**2 + (d['center'][1]-prev_center[1])**2))
 
             cap.set(cv2.CAP_PROP_POS_FRAMES, f_idx)
             ret, frame = cap.read()
             if ret and frame is not None:
                 mp_res = extract_mediapipe_angles(frame, best_cand['bbox'], pose)
-                tracked_flyer = best_cand.copy()
-                tracked_flyer['frame_idx'] = f_idx
-                tracked_flyer['split_angle'] = mp_res['split_angle']
-                tracked_flyer['arch_angle'] = mp_res['arch_angle']
-                tracked_flyer['mp_kpts'] = mp_res['mp_kpts']
-                tracked_flyer['full_bbox'] = mp_res['full_bbox']
-                tracked_flyer['ankle_y'] = mp_res['ankle_y']
-                trajectory.append(tracked_flyer)
-                prev_center = tracked_flyer['center']
+                tracked = best_cand.copy()
+                tracked['frame_idx'] = f_idx
+                tracked.update(mp_res)
+                trajectory.append(tracked)
+                prev_center = tracked['center']
 
     cap.release()
     return trajectory
 
+def generate_diagnosis(peak_data, descent_data, technique_type):
+    """【新機能】計測された角度データに基づく骨格診断アドバイスの生成"""
+    diagnoses = []
+    
+    # 1. 最高到達点（開脚）の診断
+    split_angle = peak_data.get('split_angle')
+    if split_angle is not None:
+        if split_angle >= 150:
+            diagnoses.append("✨ **開脚力（ピーク）**: 素晴らしい柔軟性とキープ力です！つま先まで美しくラインが出ています。")
+        elif split_angle >= 120:
+            diagnoses.append("👍 **開脚力（ピーク）**: 十分な開脚度です。あと少し股関節を引き上げると180度に近づきます！")
+        else:
+            diagnoses.append("💡 **開脚力（ピーク）**: 跳び出し時の蹴り出しと、空中でのつま先の引き込みを意識してみましょう。")
+    
+    # 2. 降下フェーズの診断
+    posture_angle = descent_data.get('posture_angle')
+    descent_split = descent_data.get('split_angle')
+
+    if posture_angle is not None:
+        if posture_angle >= 160:
+            diagnoses.append("🎯 **降下時の姿勢**: 体幹軸がまっすぐキープできており、美しい降下姿勢です。")
+        else:
+            diagnoses.append("⚠️ **降下時の姿勢**: 下降時に腰が少し屈曲（前かがみ）気味です。胸を起こして引き上げをキープしましょう。")
+
+    if descent_split is not None:
+        if descent_split <= 30:
+            diagnoses.append("⚡ **脚のスナップ（閉じ）**: 素早い脚閉じができています。キャッチ/着地姿勢への移行がスムーズです。")
+        elif descent_split > 60:
+            diagnoses.append("⚠️ **脚のスナップ（閉じ）**: 降下時に脚が開きっぱなしになっています。ピークを過ぎたら素早く脚を揃えましょう。")
+
+    return diagnoses
+
 def render_flyer_capture(video_path, flyer_data):
-    """Streamlit画面に表示するための画像を生成"""
+    """検出フレームの画像レンダリング"""
     if not flyer_data: return None
     cap = cv2.VideoCapture(video_path)
     cap.set(cv2.CAP_PROP_POS_FRAMES, flyer_data['frame_idx'])
@@ -208,25 +205,18 @@ def render_flyer_capture(video_path, flyer_data):
 
     bbox = flyer_data.get('full_bbox', flyer_data.get('bbox'))
     if bbox:
-        x1, y1, x2, y2 = map(int, bbox)
-        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 255), 2)
+        cv2.rectangle(frame, (int(bbox[0]), int(bbox[1])), (int(bbox[2]), int(bbox[3])), (0, 255, 255), 2)
 
     kpts = flyer_data.get('mp_kpts', {})
     for idx, pt in kpts.items():
         cv2.circle(frame, (pt[0], pt[1]), 4, (0, 0, 255), -1)
 
-    connections = [
-        (11, 12), (11, 23), (12, 24), (23, 24),
-        (23, 25), (25, 27), (27, 31),
-        (24, 26), (26, 28), (28, 32)
-    ]
+    connections = [(11, 12), (11, 23), (12, 24), (23, 24), (23, 25), (25, 27), (27, 31), (24, 26), (26, 28), (28, 32)]
     for p1, p2 in connections:
         if p1 in kpts and p2 in kpts:
             cv2.line(frame, (kpts[p1][0], kpts[p1][1]), (kpts[p2][0], kpts[p2][1]), (0, 255, 0), 2)
 
-    s_ang = flyer_data.get('split_angle')
-    p_ang = flyer_data.get('arch_angle')
-    
+    s_ang, p_ang = flyer_data.get('split_angle'), flyer_data.get('posture_angle')
     cv2.putText(frame, f"Frame: {flyer_data['frame_idx']} | Conf: {int(flyer_data['conf']*100)}%", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
     cv2.putText(frame, f"Split Angle: {s_ang if s_ang is not None else 'N/A'} deg", (20, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
     cv2.putText(frame, f"Body Posture: {p_ang if p_ang is not None else 'N/A'} deg", (20, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 150, 0), 2)
