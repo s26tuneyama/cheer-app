@@ -18,21 +18,16 @@ def calculate_angle(a, b, c):
     cosine_angle = np.clip(np.dot(ba, bc) / (norm_ba * norm_bc), -1.0, 1.0)
     return float(np.degrees(np.arccos(cosine_angle)))
 
-def extract_cheer_angles(keypoints, kpt_conf_thresh=0.35):
-    """
-    信頼度の低い関節（AIがあやふやに推定した部位）は角度判定から外す
-    """
+def extract_cheer_angles(keypoints, kpt_conf_thresh=0.25):
     if not keypoints or len(keypoints) < 17:
         return {'body_angle': None, 'split_angle': None}
     
-    # 関節ポイントの存在・信頼度確認
     def valid_pt(pt_idx):
         if pt_idx >= len(keypoints): return False
         pt = keypoints[pt_idx]
         conf = pt[2] if len(pt) > 2 else 1.0
         return (pt[0] > 0 and pt[1] > 0 and conf >= kpt_conf_thresh)
 
-    # 体幹角度計算 (肩の中点 - 腰の中点 - 膝の中点)
     body_angle = None
     if valid_pt(5) and valid_pt(6) and valid_pt(11) and valid_pt(12):
         shoulder_mid = [(keypoints[5][0] + keypoints[6][0]) / 2, (keypoints[5][1] + keypoints[6][1]) / 2]
@@ -47,7 +42,6 @@ def extract_cheer_angles(keypoints, kpt_conf_thresh=0.35):
         if knee_pt is not None:
             body_angle = calculate_angle(shoulder_mid, hip_mid, knee_pt)
 
-    # 開脚角度計算 (左足首/足 - 腰中点 - 右足首/足)
     split_angle = None
     if valid_pt(11) and valid_pt(12) and valid_pt(15) and valid_pt(16):
         hip_mid = [(keypoints[11][0] + keypoints[12][0]) / 2, (keypoints[11][1] + keypoints[12][1]) / 2]
@@ -58,10 +52,37 @@ def extract_cheer_angles(keypoints, kpt_conf_thresh=0.35):
         'split_angle': round(split_angle, 1) if split_angle is not None else None
     }
 
+def smooth_angles_median(trajectory, window_size=3):
+    """
+    【安全策】座標は触らず、算出された「角度数値」に対して
+    前後コマの中央値（メディアン）をとって一瞬の誤認識スパイクだけを弾く
+    """
+    if len(trajectory) < window_size:
+        return trajectory
+
+    num_frames = len(trajectory)
+    
+    # 開脚角度の平滑化
+    split_angles = [pt.get('split_angle') for pt in trajectory]
+    body_angles = [pt.get('body_angle') for pt in trajectory]
+
+    for i in range(num_frames):
+        start = max(0, i - window_size // 2)
+        end = min(num_frames, i + window_size // 2 + 1)
+        
+        # 開脚角度の中央値
+        valid_splits = [split_angles[k] for k in range(start, end) if split_angles[k] is not None]
+        if valid_splits:
+            trajectory[i]['split_angle'] = round(float(np.median(valid_splits)), 1)
+
+        # 体幹角度の中央値
+        valid_bodies = [body_angles[k] for k in range(start, end) if body_angles[k] is not None]
+        if valid_bodies:
+            trajectory[i]['body_angle'] = round(float(np.median(valid_bodies)), 1)
+
+    return trajectory
+
 def analyze_cheer_flyer_descent(raw_frames, max_jump_distance=180.0, min_size_ratio=0.01, min_peak_conf=0.35):
-    """
-    min_peak_conf: 天井のノイズ（Conf 20%等）を最高点として拾わないように保護
-    """
     peak_frame_idx = -1
     min_y = float('inf')
     peak_detection = None
@@ -72,13 +93,9 @@ def analyze_cheer_flyer_descent(raw_frames, max_jump_distance=180.0, min_size_ra
         min_box_h = f_height * min_size_ratio
 
         for det in frame_info['detections']:
-            if det['is_edge']: 
-                continue
-            if det.get('box_height', 0) < min_box_h:
-                continue
-            # ★ 確信度の低いノイズをピーク候補から除外
-            if det['conf'] < min_peak_conf:
-                continue
+            if det['is_edge']: continue
+            if det.get('box_height', 0) < min_box_h: continue
+            if det['conf'] < min_peak_conf: continue
 
             y_center = det['center'][1]
             if y_center < min_y:
@@ -126,9 +143,12 @@ def analyze_cheer_flyer_descent(raw_frames, max_jump_distance=180.0, min_size_ra
         else:
             break
 
+    # ★ 角度の数値に対してメディアンフィルタを適用（歪み・誤判定の完全排除）
+    trajectory = smooth_angles_median(trajectory, window_size=3)
+
     return trajectory
 
-def render_flyer_capture(video_path, flyer_data, kpt_conf_thresh=0.30):
+def render_flyer_capture(video_path, flyer_data, kpt_conf_thresh=0.20):
     if not flyer_data: return None
     cap = cv2.VideoCapture(video_path)
     cap.set(cv2.CAP_PROP_POS_FRAMES, flyer_data['frame_idx'])
@@ -143,7 +163,6 @@ def render_flyer_capture(video_path, flyer_data, kpt_conf_thresh=0.30):
 
     kpts = flyer_data.get('keypoints', [])
     if kpts and len(kpts) >= 17:
-        # 信頼度が高い関節だけ描画
         for pt in kpts:
             x, y = int(pt[0]), int(pt[1])
             conf = pt[2] if len(pt) > 2 else 1.0
