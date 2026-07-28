@@ -3,6 +3,9 @@ import cv2
 from ultralytics import YOLO
 
 def detect_and_filter_frames(video_path, conf_threshold=0.15, margin_ratio=0.10, top_margin_ratio=0.02):
+    """
+    YOLOv8m-pose を使用して人物検出とフライヤーの広域バウンディングボックスを取得
+    """
     model = YOLO('yolov8m-pose.pt')
     cap = cv2.VideoCapture(video_path)
     
@@ -21,20 +24,12 @@ def detect_and_filter_frames(video_path, conf_threshold=0.15, margin_ratio=0.10,
         if not ret: 
             break
         
-        # ★ imgsz=960 を指定して高解像度のまま骨格を捉える（メモリ増加は最小限）
-        results = model.predict(frame, classes=[0], conf=conf_threshold, imgsz=960, verbose=False)
+        results = model.predict(frame, classes=[0], conf=conf_threshold, verbose=False)
         
         detections = []
         if len(results[0].boxes) > 0:
             boxes = results[0].boxes.xyxy.cpu().numpy()
             confs = results[0].boxes.conf.cpu().numpy()
-            
-            has_kpts = results[0].keypoints is not None
-            if has_kpts:
-                kpts_xy = results[0].keypoints.xy.cpu().numpy()
-                kpts_conf = results[0].keypoints.conf.cpu().numpy() if results[0].keypoints.conf is not None else None
-            else:
-                kpts_xy, kpts_conf = [], None
             
             for i, (bbox, conf) in enumerate(zip(boxes, confs)):
                 x1, y1, x2, y2 = bbox
@@ -44,20 +39,12 @@ def detect_and_filter_frames(video_path, conf_threshold=0.15, margin_ratio=0.10,
                 
                 is_edge = not (left_bound <= x_center <= right_bound) or (y_center < top_bound)
                 
-                kpts_data = []
-                if i < len(kpts_xy):
-                    for j in range(len(kpts_xy[i])):
-                        x, y = kpts_xy[i][j]
-                        c = kpts_conf[i][j] if kpts_conf is not None else 1.0
-                        kpts_data.append([float(x), float(y), float(c)])
-                
                 detections.append({
                     'bbox': bbox.tolist(),
                     'center': [x_center, y_center],
                     'box_height': float(box_height),
                     'conf': float(conf),
-                    'is_edge': is_edge,
-                    'keypoints': kpts_data
+                    'is_edge': is_edge
                 })
                 
         raw_frames.append({
