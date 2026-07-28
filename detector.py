@@ -2,11 +2,12 @@
 import cv2
 from ultralytics import YOLO
 
-def detect_and_filter_frames(video_path, conf_threshold=0.10, margin_ratio=0.15, top_margin_ratio=0.02):
+def detect_and_filter_frames(video_path, conf_threshold=0.15, margin_ratio=0.10, top_margin_ratio=0.02):
     """
-    パラメータを自由に変更できるように汎用化
+    yolov8m-pose (Mediumモデル) を使用して高精度に骨格推定
     """
-    model = YOLO('yolov8n-pose.pt')
+    # ★ 高精度な Medium モデルに変更
+    model = YOLO('yolov8m-pose.pt')
     cap = cv2.VideoCapture(video_path)
     
     frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -32,7 +33,11 @@ def detect_and_filter_frames(video_path, conf_threshold=0.10, margin_ratio=0.15,
             confs = results[0].boxes.conf.cpu().numpy()
             
             has_kpts = results[0].keypoints is not None
-            keypoints_data = results[0].keypoints.xy.cpu().numpy() if has_kpts else []
+            if has_kpts:
+                kpts_xy = results[0].keypoints.xy.cpu().numpy()
+                kpts_conf = results[0].keypoints.conf.cpu().numpy() if results[0].keypoints.conf is not None else None
+            else:
+                kpts_xy, kpts_conf = [], None
             
             for i, (bbox, conf) in enumerate(zip(boxes, confs)):
                 x1, y1, x2, y2 = bbox
@@ -41,7 +46,14 @@ def detect_and_filter_frames(video_path, conf_threshold=0.10, margin_ratio=0.15,
                 box_height = y2 - y1
                 
                 is_edge = not (left_bound <= x_center <= right_bound) or (y_center < top_bound)
-                kpts = keypoints_data[i].tolist() if i < len(keypoints_data) else []
+                
+                # 関節データ [x, y, conf] のリストを作成
+                kpts_data = []
+                if i < len(kpts_xy):
+                    for j in range(len(kpts_xy[i])):
+                        x, y = kpts_xy[i][j]
+                        c = kpts_conf[i][j] if kpts_conf is not None else 1.0
+                        kpts_data.append([float(x), float(y), float(c)])
                 
                 detections.append({
                     'bbox': bbox.tolist(),
@@ -49,7 +61,7 @@ def detect_and_filter_frames(video_path, conf_threshold=0.10, margin_ratio=0.15,
                     'box_height': float(box_height),
                     'conf': float(conf),
                     'is_edge': is_edge,
-                    'keypoints': kpts
+                    'keypoints': kpts_data
                 })
                 
         raw_frames.append({
