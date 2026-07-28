@@ -18,7 +18,7 @@ def calculate_angle(a, b, c):
     return float(np.degrees(np.arccos(cosine_angle)))
 
 def extract_mediapipe_angles(frame, bbox, pose_estimator):
-    """MediaPipeによる関節角度・つま先・足閉じの抽出"""
+    """MediaPipeによる関節角度・つま先・左右対称性・足閉じの抽出"""
     h_orig, w_orig, _ = frame.shape
     x1, y1, x2, y2 = map(int, bbox)
     
@@ -31,13 +31,13 @@ def extract_mediapipe_angles(frame, bbox, pose_estimator):
     
     crop = frame[cy1:cy2, cx1:cx2]
     if crop.size == 0:
-        return {'split_angle': None, 'posture_angle': None, 'toe_extended': None, 'feet_closed': None, 'mp_kpts': {}, 'full_bbox': bbox, 'ankle_y': (y1 + y2) / 2}
+        return {'split_angle': None, 'posture_angle': None, 'toe_extended': None, 'leg_symmetry': None, 'feet_closed': None, 'mp_kpts': {}, 'full_bbox': bbox, 'ankle_y': (y1 + y2) / 2}
 
     crop_rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
     results = pose_estimator.process(crop_rgb)
     
     if not results.pose_landmarks:
-        return {'split_angle': None, 'posture_angle': None, 'toe_extended': None, 'feet_closed': None, 'mp_kpts': {}, 'full_bbox': bbox, 'ankle_y': (y1 + y2) / 2}
+        return {'split_angle': None, 'posture_angle': None, 'toe_extended': None, 'leg_symmetry': None, 'feet_closed': None, 'mp_kpts': {}, 'full_bbox': bbox, 'ankle_y': (y1 + y2) / 2}
 
     landmarks = results.pose_landmarks.landmark
     kpts = {}
@@ -72,14 +72,22 @@ def extract_mediapipe_angles(frame, bbox, pose_estimator):
     foot_center = [(kpts[27][0] + kpts[28][0])/2, (kpts[27][1] + kpts[28][1])/2] if 27 in kpts and 28 in kpts else None
     posture_angle = calculate_angle(shoulder_center, hip_center, foot_center) if (shoulder_center and hip_center and foot_center) else None
 
-    # 3. つま先の伸ばし判定 (膝-足首-つま先の角度が 145度以上ならポアント状態)
+    # 3. つま先の伸ばし判定 (125度以上に緩和！)
     left_toe_ang = calculate_angle(kpts[25], kpts[27], kpts[31]) if (25 in kpts and 27 in kpts and 31 in kpts) else None
     right_toe_ang = calculate_angle(kpts[26], kpts[28], kpts[32]) if (26 in kpts and 28 in kpts and 32 in kpts) else None
     
     toe_angles = [a for a in [left_toe_ang, right_toe_ang] if a is not None]
-    toe_extended = (sum(toe_angles) / len(toe_angles) >= 145) if toe_angles else None
+    toe_extended = (sum(toe_angles) / len(toe_angles) >= 125) if toe_angles else None
 
-    # 4. 着地の足閉じ判定 (左右の足首の距離が腰幅と同等以下か)
+    # 4. 左右対称性（脚の上がり方の差が15度以内か）
+    leg_symmetry = None
+    if hip_center and left_foot and right_foot and 23 in kpts and 24 in kpts:
+        left_ang = calculate_angle(kpts[24], hip_center, left_foot)
+        right_ang = calculate_angle(kpts[23], hip_center, right_foot)
+        if left_ang is not None and right_ang is not None:
+            leg_symmetry = (abs(left_ang - right_ang) <= 15.0)
+
+    # 5. 着地の足閉じ判定
     feet_closed = None
     if 27 in kpts and 28 in kpts and 23 in kpts and 24 in kpts:
         feet_dist = abs(kpts[27][0] - kpts[28][0])
@@ -92,6 +100,7 @@ def extract_mediapipe_angles(frame, bbox, pose_estimator):
         'split_angle': round(split_angle, 1) if split_angle else None,
         'posture_angle': round(posture_angle, 1) if posture_angle else None,
         'toe_extended': toe_extended,
+        'leg_symmetry': leg_symmetry,
         'feet_closed': feet_closed,
         'mp_kpts': kpts,
         'full_bbox': full_bbox,
