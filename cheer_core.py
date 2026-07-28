@@ -1,4 +1,4 @@
-# cheer_logic.py
+# cheer_core.py
 import cv2
 import numpy as np
 import mediapipe as mp
@@ -52,14 +52,12 @@ def extract_mediapipe_angles(frame, bbox, pose_estimator):
             x_coords.append(abs_x)
             y_coords.append(abs_y)
 
-    # 関節座標の取得
     hip_center = [(kpts[23][0] + kpts[24][0])/2, (kpts[23][1] + kpts[24][1])/2] if 23 in kpts and 24 in kpts else None
     shoulder_center = [(kpts[11][0] + kpts[12][0])/2, (kpts[11][1] + kpts[12][1])/2] if 11 in kpts and 12 in kpts else None
     
     left_foot = kpts.get(31, kpts.get(27))
     right_foot = kpts.get(32, kpts.get(28))
 
-    # 足首/つま先高さ (ankle_y)
     if left_foot and right_foot:
         ankle_y = (left_foot[1] + right_foot[1]) / 2.0
     elif left_foot or right_foot:
@@ -67,14 +65,10 @@ def extract_mediapipe_angles(frame, bbox, pose_estimator):
     else:
         ankle_y = (y1 + y2) / 2.0
 
-    # 開脚角度 (Split Angle)
     split_angle = calculate_angle(left_foot, hip_center, right_foot) if (hip_center and left_foot and right_foot) else None
-
-    # 体幹姿勢角度 (Posture Angle: 肩-腰-足首)
     foot_center = [(kpts[27][0] + kpts[28][0])/2, (kpts[27][1] + kpts[28][1])/2] if 27 in kpts and 28 in kpts else None
     posture_angle = calculate_angle(shoulder_center, hip_center, foot_center) if (shoulder_center and hip_center and foot_center) else None
 
-    # Bounding Box調整
     full_bbox = [max(0, min(x_coords) - 15), max(0, min(y_coords) - 15), min(w_orig, max(x_coords) + 15), min(h_orig, max(y_coords) + 15)] if (x_coords and y_coords) else bbox
 
     return {
@@ -85,8 +79,8 @@ def extract_mediapipe_angles(frame, bbox, pose_estimator):
         'ankle_y': ankle_y
     }
 
-def analyze_cheer_motion(video_path, raw_frames, technique_type="トータッチ・トス（フライヤー）", max_jump_distance=350.0, min_size_ratio=0.01, min_peak_conf=0.15):
-    """動体追跡 ＆ 軌道計算メインロジック"""
+def analyze_cheer_motion(video_path, raw_frames, max_jump_distance=350.0, min_size_ratio=0.01, min_peak_conf=0.15):
+    """共通トラッキング処理"""
     candidates = []
     for frame_info in raw_frames:
         f_idx = frame_info['frame_idx']
@@ -125,20 +119,16 @@ def analyze_cheer_motion(video_path, raw_frames, technique_type="トータッチ
             cap.release()
             return []
 
-        # 最高到達点（つま先位置が一番高いフレーム）
         peak_detection = min(valid_candidates, key=lambda x: x['ankle_y'])
         trajectory = [peak_detection]
         prev_center = peak_detection['center']
 
-        # 降下追尾
         descent_frames = [f for f in raw_frames if f['frame_idx'] > peak_detection['frame_idx']]
         missing_count = 0
 
         for frame_info in descent_frames:
             f_idx = frame_info['frame_idx']
             valid_dets = [d for d in frame_info['detections'] if not d['is_edge']]
-            
-            # 最も近い人物を追う（近接トラッキング）
             close_dets = [d for d in valid_dets if np.sqrt((d['center'][0]-prev_center[0])**2 + (d['center'][1]-prev_center[1])**2) <= max_jump_distance]
 
             if not close_dets:
@@ -162,44 +152,8 @@ def analyze_cheer_motion(video_path, raw_frames, technique_type="トータッチ
     cap.release()
     return trajectory
 
-def generate_diagnosis(peak_data, descent_data, technique_type):
-    """高空スナップ評価に対応した骨格診断"""
-    diagnoses = []
-    
-    # 1. 最高到達点（開脚）の診断
-    split_angle = peak_data.get('split_angle')
-    if split_angle is not None:
-        if split_angle >= 150:
-            diagnoses.append("✨ **開脚力（ピーク）**: 素晴らしい柔軟性とキープ力です！つま先まで美しくラインが出ています。")
-        elif split_angle >= 120:
-            diagnoses.append("👍 **開脚力（ピーク）**: 十分な開脚度です。あと少し股関節を引き上げると180度に近づきます！")
-        else:
-            diagnoses.append("💡 **開脚力（ピーク）**: 跳び出し時の蹴り出しと、空中でのつま先の引き込みを意識してみましょう。")
-    
-    # 2. 高空スナップ（脚閉じ）の診断
-    descent_split = descent_data.get('split_angle')
-    posture_angle = descent_data.get('posture_angle')
-
-    if descent_split is not None:
-        if descent_split <= 35:
-            diagnoses.append("⚡ **高空スナップ**: 頂点直後の脚閉じが非常にスピーディーで綺麗です！")
-        elif descent_split > 60:
-            diagnoses.append("⚠️ **高空スナップ**: 頂点を過ぎた後、脚を閉じるタイミングが少し遅れている可能性があります。ピーク直後に素早く寄せる意識を持ちましょう。")
-        else:
-            diagnoses.append("👍 **高空スナップ**: 空中でスピーディーに脚を寄せています。")
-    else:
-        diagnoses.append("⚡ **高空スナップ**: 左右の脚がぴったり重なるほど綺麗に閉じ切っています！（関節重なり＝完全スナップの証拠です）")
-
-    if posture_angle is not None:
-        if posture_angle >= 160:
-            diagnoses.append("🎯 **空中姿勢（体幹）**: 軸がブレずまっすぐキープできています。")
-        else:
-            diagnoses.append("⚠️ **空中姿勢（体幹）**: 空中で腰がやや曲がり気味です。胸と引き上げを意識しましょう。")
-
-    return diagnoses
-
 def render_flyer_capture(video_path, flyer_data):
-    """検出フレームの画像レンダリング"""
+    """描画処理"""
     if not flyer_data: return None
     cap = cv2.VideoCapture(video_path)
     cap.set(cv2.CAP_PROP_POS_FRAMES, flyer_data['frame_idx'])
