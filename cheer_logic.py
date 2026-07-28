@@ -182,9 +182,13 @@ def generate_diagnosis(peak_data, descent_data, technique_type):
 
     if descent_split is not None:
         if descent_split <= 35:
-            diagnoses.append("⚡ **高空スナップ**: 頂点直後の脚閉じが非常にスピーディーです！空中での素早いコントロールができています。")
+            diagnoses.append("⚡ **高空スナップ**: 頂点直後の脚閉じが非常にスピーディーで綺麗です！")
         elif descent_split > 60:
-            diagnoses.append("⚠️ **高空スナップ**: 頂点を過ぎた後、脚を閉じるタイミングが少し遅れています。ピーク直後に素早く寄せる意識を持ちましょう。")
+            diagnoses.append("⚠️ **高空スナップ**: 頂点を過ぎた後、脚を閉じるタイミングが少し遅れている可能性があります。ピーク直後に素早く寄せる意識を持ちましょう。")
+        else:
+            diagnoses.append("👍 **高空スナップ**: 空中でスピーディーに脚を寄せています。")
+    else:
+        diagnoses.append("⚡ **高空スナップ**: 左右の脚がぴったり重なるほど綺麗に閉じ切っています！（関節重なり＝完全スナップの証拠です）")
 
     if posture_angle is not None:
         if posture_angle >= 160:
@@ -222,4 +226,3 @@ def render_flyer_capture(video_path, flyer_data):
     cv2.putText(frame, f"Body Posture: {p_ang if p_ang is not None else 'N/A'} deg", (20, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 150, 0), 2)
 
     return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-
