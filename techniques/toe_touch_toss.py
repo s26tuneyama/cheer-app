@@ -2,39 +2,44 @@
 
 def select_best_frames(trajectory):
     """
-    トータッチ・トス：
-    1. 最高到達点 (peak_data)
-    2. 最高到達点後のアーチ/キャッチ準備コマ (arch_data)
-    を選出して返します。
+    トータッチ・トス：根拠画像（コマ撮り）用の4主要コマを選出
+    1. 空中初期 (early_data)
+    2. ピーク直前 (just_before_data)
+    3. 最高到達点 (peak_data)
+    4. 反り・アーチ/キャッチ (arch_data)
     """
     if not trajectory:
-        return None, None
+        return None, None, None, None
 
-    # 最も高い位置（ankle_yが最小）をピークとする
+    # ピーク（最高到達点）
     peak_data = min(trajectory, key=lambda x: x.get('ankle_y', 9999))
     peak_f_idx = peak_data['frame_idx']
 
-    # 最高到達点よりあとのフレーム（下降・アーチ局面）
-    post_peak_frames = [d for d in trajectory if d['frame_idx'] > peak_f_idx]
+    ascent_frames = [d for d in trajectory if d['frame_idx'] < peak_f_idx]
+    ascent_frames.sort(key=lambda x: x['frame_idx'])
 
+    post_peak_frames = [d for d in trajectory if d['frame_idx'] > peak_f_idx]
+    post_peak_frames.sort(key=lambda x: x['frame_idx'])
+
+    # ① 空中初期（離空直後）
+    early_data = ascent_frames[0] if ascent_frames else peak_data
+
+    # ② ピーク直前
+    just_before_data = ascent_frames[-1] if len(ascent_frames) >= 2 else early_data
+
+    # ④ 反り・アーチ局面
     if post_peak_frames:
-        # ピークから少し落ちたあたり（3〜10フレーム後）をアーチ局面とする
         arch_candidates = [d for d in post_peak_frames if (peak_f_idx + 3) <= d['frame_idx'] <= (peak_f_idx + 10)]
         arch_data = arch_candidates[0] if arch_candidates else post_peak_frames[0]
     else:
         arch_data = peak_data
 
-    return peak_data, arch_data
+    return early_data, just_before_data, peak_data, arch_data
 
 
-def generate_diagnosis(peak_data, descent_data, trajectory=None):
+def generate_diagnosis(early_data, just_before_data, peak_data, arch_data, trajectory=None):
     """
     トータッチ・トス専用 AIフォーム診断
-    
-    1. 【空中局面の最初】脚を閉じられているか
-    2. 【最高到達点直前】脚を素早く開けているか
-    3. 【最高到達点】ジャンプ共通（開脚角・つま先・上体・左右差）
-    4. 【最高到達点後】「反り（アーチ）」ができているか／脚が閉じられているか
     """
     improvements = []  # 🚨 修正・改善ポイント
     good_points = []   # 🎯 ナイスポイント
@@ -42,98 +47,88 @@ def generate_diagnosis(peak_data, descent_data, trajectory=None):
     if not peak_data:
         return ["⚠️ 解析データが不足しています。"]
 
-    peak_f_idx = peak_data['frame_idx']
-
-    # 上昇局面（ピーク以前）のフレームを取得
-    ascent_frames = [d for d in (trajectory or []) if d['frame_idx'] < peak_f_idx]
-    ascent_frames.sort(key=lambda x: x['frame_idx'])
-
     # -------------------------------------------------------------
-    # 1. 【空中局面の最初】脚閉じ判定
+    # 1. 【空中局面の最初】脚閉じ判定 (YOLOアスペクト比 / split_angle)
     # -------------------------------------------------------------
-    if ascent_frames:
-        early_frame = ascent_frames[0]  # 離空直後のコマ
-        early_split = early_frame.get('split_angle')
-        early_closed = early_frame.get('feet_closed')
+    if early_data:
+        e_split = early_data.get('split_angle')
+        e_box = early_data.get('bbox', [0, 0, 1, 1])
+        e_w, e_h = max(1.0, e_box[2] - e_box[0]), max(1.0, e_box[3] - e_box[1])
+        e_aspect = e_w / e_h  # 横/縦比
 
-        if (early_split is not None and early_split <= 50) or early_closed is True:
-            good_points.append("✨ **【空中局面の最初】脚の締め**: 離空直後に脚をしっかり閉じられています！")
+        if (e_split is not None and e_split <= 50) or e_aspect <= 0.65:
+            good_points.append("✨ **【① 空中初期】脚の締め**: 離空直後に脚をしっかり閉じられています！")
         else:
-            improvements.append("💡 **【空中局面の最初】脚の締め**: 離空直後は脚をしっかり閉じましょう（開きが早すぎます）")
+            improvements.append("💡 **【① 空中初期】脚の締め**: 離空直後は脚をしっかり閉じましょう（開き始めが早すぎます）")
 
     # -------------------------------------------------------------
-    # 2. 【最高到達点直前】素早い開脚動作
+    # 2. 【最高到達点直前】開脚展開スピード（足りない角度の算出）
     # -------------------------------------------------------------
-    if len(ascent_frames) >= 2:
-        just_before_frame = ascent_frames[-1]  # ピーク直前のコマ
-        jb_split = just_before_frame.get('split_angle')
+    TARGET_SPEED = 20.0  # ピーク直前からピークへの目標開脚変化量（度）
+
+    if just_before_data and peak_data:
+        jb_split = just_before_data.get('split_angle')
         pk_split = peak_data.get('split_angle')
 
-        # 直前からピークにかけて大きく開けているか
         if jb_split is not None and pk_split is not None:
-            if (pk_split - jb_split) >= 15:  # 直前に一気に開いている
-                good_points.append("✨ **【最高到達点直前】タイミング**: ピーク直前に素早く脚を開けています！")
+            diff = pk_split - jb_split
+            if diff >= TARGET_SPEED:
+                good_points.append(f"✨ **【② 最高到達点直前】開脚スピード**: ピーク直前に素早く一気に開脚できています！（変化量: +{diff:.1f}°）")
             else:
-                improvements.append("💡 **【最高到達点直前】タイミング**: 最高到達点直前で一気に脚を開く意識を持ちましょう")
+                shortage = TARGET_SPEED - diff
+                improvements.append(f"💡 **【② 最高到達点直前】開脚スピード**: 開脚スピードが **あと {shortage:.1f}°** 足りません（現在: +{diff:.1f}° / 目標: +{TARGET_SPEED:.1f}°）。ピーク直前に一気に開く意識を持ちましょう")
 
     # -------------------------------------------------------------
-    # 3. 【最高到達点】姿勢評価（ジャンプ共通）
+    # 3. 【最高到達点】姿勢評価（※上体判定は除外）
     # -------------------------------------------------------------
     # ① 開脚角度
     split_angle = peak_data.get('split_angle')
     if split_angle is not None:
         if split_angle < 90:
-            improvements.append("💡 **【最高到達点】開脚角度**: 開脚角度を上げましょう")
+            improvements.append("💡 **【③ 最高到達点】開脚角度**: 開脚角度を上げましょう")
         else:
-            good_points.append("✨ **【最高到達点】開脚角度**: 開脚角度は良好です！")
+            good_points.append("✨ **【③ 最高到達点】開脚角度**: 開脚角度は良好です！")
 
     # ② つま先
     toe_extended = peak_data.get('toe_extended')
     if toe_extended is True:
-        good_points.append("✨ **【最高到達点】つま先**: つま先が伸びています！")
+        good_points.append("✨ **【③ 最高到達点】つま先**: つま先が伸びています！")
     else:
-        improvements.append("💡 **【最高到達点】つま先**: つま先を伸ばしましょう")
+        improvements.append("💡 **【③ 最高到達点】つま先**: つま先を伸ばしましょう")
 
-    # ③ 上体
-    posture_angle = peak_data.get('posture_angle')
-    if posture_angle is not None and posture_angle < 130:
-        improvements.append("💡 **【最高到達点】上体**: 上体をしっかり起こしましょう")
-    else:
-        good_points.append("✨ **【最高到達点】上体**: 上体がしっかり起こせています！")
-
-    # ④ 左右対称性
+    # ③ 左右対称性
     leg_symmetry = peak_data.get('leg_symmetry')
     if leg_symmetry is False:
-        improvements.append("💡 **【最高到達点】左右差**: 脚の上がり方の左右差があります")
+        improvements.append("💡 **【③ 最高到達点】左右差**: 脚の上がり方の左右差があります")
     else:
-        good_points.append("✨ **【最高到達点】左右差**: 脚の上がり方は対称です！")
+        good_points.append("✨ **【③ 最高到達点】左右差**: 脚の上がり方は対称です！")
 
     # -------------------------------------------------------------
-    # 4. 【最高到達点後】「反り（アーチ）」と「脚閉じ」の評価
+    # 4. 【最高到達点後】「反り（アーチ）」＆「脚閉じ」 (YOLO縦横サイズ変化で判定)
     # -------------------------------------------------------------
-    if descent_data:
-        descent_split = descent_data.get('split_angle')
-        feet_closed = descent_data.get('feet_closed')
-        posture_angle = descent_data.get('posture_angle')
+    if peak_data and arch_data:
+        # ピーク時のバウンディングボックス（開脚中で最も横長）
+        p_box = peak_data.get('bbox', [0, 0, 1, 1])
+        p_w = max(1.0, p_box[2] - p_box[0])
 
-        # A. 脚の引きつけ・閉じ
-        if (descent_split is not None and descent_split <= 50) or feet_closed is True:
-            good_points.append("✨ **【最高到達点後】脚閉じ**: 開脚後に素早く脚を閉じられています！")
+        # アーチ/後続コマ時のバウンディングボックス
+        a_box = arch_data.get('bbox', [0, 0, 1, 1])
+        a_w, a_h = max(1.0, a_box[2] - a_box[0]), max(1.0, a_box[3] - a_box[1])
+        a_aspect = a_w / a_h
+
+        # ピークの横幅に対する縮小率
+        width_ratio = a_w / p_w
+
+        # 横幅がピーク時の60%以下に縮小、または縦長（アスペクト比0.7以下）になっていれば反り＆脚閉じ成功！
+        if width_ratio <= 0.60 or a_aspect <= 0.70:
+            good_points.append("✨ **【④ 最高到達点後】反り（アーチ）＆脚閉じ**: 開脚後に足を素早く閉じ、綺麗な反り（アーチ）姿勢ができています！")
         else:
-            improvements.append("💡 **【最高到達点後】脚閉じ**: 開脚のあとは素早く脚を閉じましょう")
-
-        # B. 体の「反り（アーチ）」判定
-        # 上体が起こされたまま（起きっぱなし）だとNG、少し胸を張って反る姿勢ができていればOK
-        if posture_angle is not None and posture_angle >= 155:
-            good_points.append("✨ **【最高到達点後】反り（アーチ）**: トス後の美しい反り動作（アーチ）ができています！")
-        else:
-            improvements.append("💡 **【最高到達点後】反り（アーチ）**: 上体が起きっぱなしです。トス後は胸を張って体をしっかり反らせましょう")
+            improvements.append("💡 **【④ 最高到達点後】反り（アーチ）＆脚閉じ**: 体・脚が開いたままになっています。開脚後はすぐに足を閉じて胸を張り、コンパクトに体を反らせましょう")
 
     # -------------------------------------------------------------
-    # グループ化して返却（改善点優先）
+    # レポート組み立て（要改善ポイントを上部に配置）
     # -------------------------------------------------------------
     diagnoses = []
-    
     if improvements:
         diagnoses.append("### 🚨 修正・改善ポイント")
         diagnoses.extend(improvements)
