@@ -10,10 +10,29 @@ st.set_page_config(page_title="Cheer Flyer Analyzer", layout="wide")
 st.title("📣 チアリーディング フライヤーフォーム解析")
 st.caption("ジャンプの最高到達点（最大開脚）と、降下フェーズでの姿勢・スナップを自動分析します。")
 
-# サイドバー設定
-st.sidebar.header("⚡ 検出パラメーター設定")
-min_conf = st.sidebar.slider("AI全体感度 (Conf)", 0.05, 0.50, 0.15, 0.05)
-min_peak_conf = st.sidebar.slider("ピーク検知の最小確信度", 0.10, 0.50, 0.35, 0.05)
+# --- サイドバー設定（以前の設定を完全復元） ---
+st.sidebar.markdown("### ⚡ 処理スピード & 精度設定")
+step_option = st.sidebar.select_slider(
+    "解析スピード",
+    options=["爆速 (4コマごと)", "高速 (3コマごと)", "標準 (2コマごと)", "最高精度 (全コマ)"],
+    value="標準 (2コマごと)"
+)
+
+frame_step = 2
+if "爆速" in step_option:
+    frame_step = 4
+elif "高速" in step_option:
+    frame_step = 3
+elif "標準" in step_option:
+    frame_step = 2
+elif "最高精度" in step_option:
+    frame_step = 1
+
+st.sidebar.markdown("### ⚙️ 検出エリア調整")
+min_conf = st.sidebar.slider("AI全体感度 (Conf)", 0.01, 0.50, 0.15, 0.01)
+min_peak_conf = st.sidebar.slider("ピーク検知の最小確信度", 0.05, 0.80, 0.35, 0.05)
+side_crop_pct = st.sidebar.slider("左右端カット率 (%)", 0, 30, 8, 1)
+top_crop_pct = st.sidebar.slider("天井ノイズカット率 (%)", 0, 20, 2, 1)
 
 # モデルロード（キャッシュ化）
 @st.cache_resource
@@ -34,15 +53,20 @@ if uploaded_file is not None:
     st.video(video_path)
 
     if st.button("🚀 フォーム解析を実行", type="primary"):
-        with st.spinner("YOLO検出 ＆ MediaPipe骨格解析を実行中..."):
-            cap = cv2.VideoCapture(video_path)
-            raw_frames = []
-            f_idx = 0
+        # プログレスバー & ステータステキストの初期化
+        progress_bar = st.progress(0)
+        status_text = st.empty()
 
-            while cap.isOpened():
-                ret, frame = cap.read()
-                if not ret: break
+        cap = cv2.VideoCapture(video_path)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        raw_frames = []
+        f_idx = 0
 
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret: break
+
+            if f_idx % frame_step == 0:
                 h, w, _ = frame.shape
                 results = yolo_model(frame, verbose=False, conf=min_conf)
                 
@@ -54,8 +78,11 @@ if uploaded_file is not None:
                         conf = float(box.conf[0])
                         cx, cy = (b[0] + b[2]) / 2, (b[1] + b[3]) / 2
                         
-                        # 画面端チェック
-                        is_edge = (b[0] < w * 0.05) or (b[2] > w * 0.95)
+                        # 端・天井カット判定
+                        side_margin = w * (side_crop_pct / 100.0)
+                        top_margin = h * (top_crop_pct / 100.0)
+                        is_edge = (b[0] < side_margin) or (b[2] > (w - side_margin)) or (b[1] < top_margin)
+
                         detections.append({
                             'bbox': b.tolist(),
                             'center': (cx, cy),
@@ -70,16 +97,28 @@ if uploaded_file is not None:
                     'frame_width': w,
                     'detections': detections
                 })
-                f_idx += 1
 
-            cap.release()
+            f_idx += 1
+            
+            # プログレスバーをリアルタイム更新
+            if total_frames > 0:
+                pct = min(1.0, f_idx / total_frames)
+                progress_bar.progress(pct)
+                status_text.text(f"⏳ 動画解析中... {f_idx}/{total_frames} フレーム ({int(pct * 100)}%)")
 
-            # フライヤー軌道＆姿勢の解析
-            trajectory = analyze_cheer_flyer_descent(
-                video_path, 
-                raw_frames, 
-                min_peak_conf=min_peak_conf
-            )
+        cap.release()
+
+        status_text.text("🦴 骨格・姿勢の精密分析を実行中...")
+        
+        # フライヤー軌道＆姿勢の解析
+        trajectory = analyze_cheer_flyer_descent(
+            video_path, 
+            raw_frames, 
+            min_peak_conf=min_peak_conf
+        )
+
+        progress_bar.progress(1.0)
+        status_text.empty()  # 解析完了後にテキストをクリア
 
         if not trajectory:
             st.error("フライヤーのジャンプ技がうまく検出できませんでした。設定の感度を調整してみてください。")
@@ -101,13 +140,10 @@ if uploaded_file is not None:
                     st.metric("開脚角度 (Split Angle)", f"{peak_data.get('split_angle', 'N/A')} deg")
                     st.caption(f"検出フレーム: {peak_data['frame_idx']} | 信頼度: {int(peak_data['conf']*100)}%")
 
-            # 2. 降下時の姿勢（スナップ・腰の伸ばし）
-            # 降下中のフレームから、脚を閉じ始めている・あるいは降下中盤のコマを選択
+            # 2. 降下時の姿勢（スナップ・腰の伸び）
             descent_data = None
             if len(trajectory) > 1:
-                # 降下中の後半または開脚角度が狭まってきたコマを取得
                 descent_candidates = trajectory[1:]
-                # 足が閉じ始めているコマ（split_angleが最小）をピックアップ
                 valid_descent = [d for d in descent_candidates if d.get('split_angle') is not None]
                 if valid_descent:
                     descent_data = min(valid_descent, key=lambda x: x['split_angle'])
