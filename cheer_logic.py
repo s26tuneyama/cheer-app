@@ -138,7 +138,7 @@ def analyze_cheer_motion(video_path, raw_frames, technique_type="トータッチ
             f_idx = frame_info['frame_idx']
             valid_dets = [d for d in frame_info['detections'] if not d['is_edge']]
             
-            # 最も近い人物を追う（シンプルで標準的な近接トラッキング）
+            # 最も近い人物を追う（近接トラッキング）
             close_dets = [d for d in valid_dets if np.sqrt((d['center'][0]-prev_center[0])**2 + (d['center'][1]-prev_center[1])**2) <= max_jump_distance]
 
             if not close_dets:
@@ -163,7 +163,7 @@ def analyze_cheer_motion(video_path, raw_frames, technique_type="トータッチ
     return trajectory
 
 def generate_diagnosis(peak_data, descent_data, technique_type):
-    """【新機能】計測された角度データに基づく骨格診断アドバイスの生成"""
+    """高空スナップ評価に対応した骨格診断"""
     diagnoses = []
     
     # 1. 最高到達点（開脚）の診断
@@ -176,21 +176,21 @@ def generate_diagnosis(peak_data, descent_data, technique_type):
         else:
             diagnoses.append("💡 **開脚力（ピーク）**: 跳び出し時の蹴り出しと、空中でのつま先の引き込みを意識してみましょう。")
     
-    # 2. 降下フェーズの診断
-    posture_angle = descent_data.get('posture_angle')
+    # 2. 高空スナップ（脚閉じ）の診断
     descent_split = descent_data.get('split_angle')
+    posture_angle = descent_data.get('posture_angle')
+
+    if descent_split is not None:
+        if descent_split <= 35:
+            diagnoses.append("⚡ **高空スナップ**: 頂点直後の脚閉じが非常にスピーディーです！空中での素早いコントロールができています。")
+        elif descent_split > 60:
+            diagnoses.append("⚠️ **高空スナップ**: 頂点を過ぎた後、脚を閉じるタイミングが少し遅れています。ピーク直後に素早く寄せる意識を持ちましょう。")
 
     if posture_angle is not None:
         if posture_angle >= 160:
-            diagnoses.append("🎯 **降下時の姿勢**: 体幹軸がまっすぐキープできており、美しい降下姿勢です。")
+            diagnoses.append("🎯 **空中姿勢（体幹）**: 軸がブレずまっすぐキープできています。")
         else:
-            diagnoses.append("⚠️ **降下時の姿勢**: 下降時に腰が少し屈曲（前かがみ）気味です。胸を起こして引き上げをキープしましょう。")
-
-    if descent_split is not None:
-        if descent_split <= 30:
-            diagnoses.append("⚡ **脚のスナップ（閉じ）**: 素早い脚閉じができています。キャッチ/着地姿勢への移行がスムーズです。")
-        elif descent_split > 60:
-            diagnoses.append("⚠️ **脚のスナップ（閉じ）**: 降下時に脚が開きっぱなしになっています。ピークを過ぎたら素早く脚を揃えましょう。")
+            diagnoses.append("⚠️ **空中姿勢（体幹）**: 空中で腰がやや曲がり気味です。胸と引き上げを意識しましょう。")
 
     return diagnoses
 
