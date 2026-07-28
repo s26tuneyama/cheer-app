@@ -1,3 +1,4 @@
+# app.py
 import streamlit as st
 import cv2
 import tempfile
@@ -8,7 +9,7 @@ from ultralytics import YOLO
 st.set_page_config(page_title="Cheer Form Analyzer", layout="wide")
 
 st.title("📣 チアリーディング フォーム＆技診断 AI")
-st.caption("AIが技の最高到達点と降下姿勢を検出し、骨格に基づいたアドバイスを自動生成します。")
+st.caption("AIが技の最高到達点と高空スナップ姿勢を検出し、骨格に基づいたアドバイスを自動生成します。")
 
 # --- サイドバー設定 ---
 st.sidebar.markdown("### 🎯 技の選択")
@@ -112,17 +113,23 @@ if uploaded_file is not None:
 
             # カード選出
             peak_data = trajectory[0]
-            
-            # 降下カードの選出（ピークから一定以上離れたフレーム）
             peak_f_idx = peak_data['frame_idx']
-            offset = 5 if "ジャンプ" in technique_type else 8
-            descent_candidates = [d for d in trajectory if d['frame_idx'] >= peak_f_idx + offset]
+            
+            # ★ 高空域（ピーク直後 3〜12コマ以内）のみに候補を限定
+            high_altitude_window = [
+                d for d in trajectory 
+                if (peak_f_idx + 3) <= d['frame_idx'] <= (peak_f_idx + 12)
+            ]
 
-            if descent_candidates:
-                valid_splits = [d for d in descent_candidates if d.get('split_angle') is not None]
-                descent_data = min(valid_splits, key=lambda x: x['split_angle']) if valid_splits else descent_candidates[-1]
+            if high_altitude_window:
+                valid_splits = [d for d in high_altitude_window if d.get('split_angle') is not None]
+                if valid_splits:
+                    descent_data = min(valid_splits, key=lambda x: x['split_angle'])
+                else:
+                    descent_data = high_altitude_window[0]
             else:
-                descent_data = trajectory[-1] if len(trajectory) > 1 else peak_data
+                fallback_candidates = [d for d in trajectory if d['frame_idx'] > peak_f_idx]
+                descent_data = fallback_candidates[0] if fallback_candidates else peak_data
 
             # 2列表示
             col1, col2 = st.columns(2)
@@ -137,11 +144,11 @@ if uploaded_file is not None:
 
             img_descent = render_flyer_capture(video_path, descent_data)
             with col2:
-                st.subheader("📉 2. 降下時の姿勢（スナップ ＆ 体幹）")
+                st.subheader("📉 2. 高空スナップ（頂点直後の脚閉じ）")
                 if img_descent is not None:
                     st.image(img_descent, use_column_width=True)
+                    st.metric("高空スナップ角度 (Snap Angle)", f"{descent_data.get('split_angle', 'N/A')} deg")
                     st.metric("体幹角度 (Body Posture)", f"{descent_data.get('posture_angle', 'N/A')} deg")
-                    st.metric("降下時開脚度 (Snap Angle)", f"{descent_data.get('split_angle', 'N/A')} deg")
                     st.caption(f"検出フレーム: {descent_data['frame_idx']} | 信頼度: {int(descent_data['conf']*100)}%")
 
             # 📋 AI骨格診断フィードバックの表示
