@@ -18,7 +18,7 @@ def calculate_angle(a, b, c):
 
 def extract_mediapipe_angles(frame, bbox, pose_estimator):
     """
-    180度開脚やつま先を逃さない広範囲クロップ ＋ 「足先・足首の高さ（Ankle Y）」の測定
+    足首最高到達点(ankle_y) ＋ 開脚角度(split_angle) ＋ 降下時の腰伸展・姿勢角度(posture_angle)の計測
     """
     h_orig, w_orig, _ = frame.shape
     x1, y1, x2, y2 = map(int, bbox)
@@ -56,14 +56,18 @@ def extract_mediapipe_angles(frame, bbox, pose_estimator):
             x_coords.append(abs_x)
             y_coords.append(abs_y)
 
-    # 1. 腰の検出
+    # 1. 腰・肩の検出
     hip_center = None
     if 23 in kpts and 24 in kpts:
         hip_center = [(kpts[23][0] + kpts[24][0])/2, (kpts[23][1] + kpts[24][1])/2]
 
-    # 2. 足首/つま先の高さ（Ankle/Toe Y座標）算出 ➔ チアジャンプの「最高到達点」の真の基準！
-    left_foot = kpts.get(31, kpts.get(27)) # 31=つま先, 27=足首
-    right_foot = kpts.get(32, kpts.get(28)) # 32=つま先, 28=足首
+    shoulder_center = None
+    if 11 in kpts and 12 in kpts:
+        shoulder_center = [(kpts[11][0] + kpts[12][0])/2, (kpts[11][1] + kpts[12][1])/2]
+
+    # 2. 足首/つま先の高さ（Ankle Y）
+    left_foot = kpts.get(31, kpts.get(27))
+    right_foot = kpts.get(32, kpts.get(28))
 
     if left_foot and right_foot:
         ankle_y = (left_foot[1] + right_foot[1]) / 2.0
@@ -74,26 +78,19 @@ def extract_mediapipe_angles(frame, bbox, pose_estimator):
     else:
         ankle_y = (y1 + y2) / 2.0
 
-    # 3. 最大開脚角度（左足 - 腰 - 右足）
+    # 3. 開脚角度（Split Angle）
     split_angle = None
     if hip_center and left_foot and right_foot:
         split_angle = calculate_angle(left_foot, hip_center, right_foot)
 
-    # 4. 体の反り角度（Arch）
-    arch_angle = None
-    if split_angle is None or split_angle < 45.0:
-        shoulder_center = None
-        foot_center = None
-        if 11 in kpts and 12 in kpts:
-            shoulder_center = [(kpts[11][0] + kpts[12][0])/2, (kpts[11][1] + kpts[12][1])/2]
-        if 27 in kpts and 28 in kpts:
-            foot_center = [(kpts[27][0] + kpts[28][0])/2, (kpts[27][1] + kpts[28][1])/2]
+    # 4. 腰の伸び・姿勢角度（肩-腰-足首）：屈曲（前かがみ）していないか
+    foot_center = None
+    if 27 in kpts and 28 in kpts:
+        foot_center = [(kpts[27][0] + kpts[28][0])/2, (kpts[27][1] + kpts[28][1])/2]
 
-        if shoulder_center and hip_center and foot_center:
-            if foot_center[1] > hip_center[1]: 
-                raw_arch = calculate_angle(shoulder_center, hip_center, foot_center)
-                if raw_arch is not None and raw_arch < 165.0:
-                    arch_angle = round(180.0 - raw_arch, 1)
+    posture_angle = None
+    if shoulder_center and hip_center and foot_center:
+        posture_angle = calculate_angle(shoulder_center, hip_center, foot_center)
 
     # 全身を囲むバウンディングボックス
     if x_coords and y_coords:
@@ -105,7 +102,7 @@ def extract_mediapipe_angles(frame, bbox, pose_estimator):
 
     return {
         'split_angle': round(split_angle, 1) if split_angle else None,
-        'arch_angle': arch_angle,
+        'arch_angle': round(posture_angle, 1) if posture_angle else None,
         'mp_kpts': kpts,
         'full_bbox': full_bbox,
         'ankle_y': ankle_y
@@ -136,7 +133,7 @@ def analyze_cheer_flyer_descent(video_path, raw_frames, max_jump_distance=180.0,
     valid_flyer_candidates = []
 
     with mp_pose.Pose(static_image_mode=True, model_complexity=1, min_detection_confidence=0.3) as pose:
-        for cand in candidates[:20]: # 確実な判定のためにスキャン範囲を拡大
+        for cand in candidates[:20]:
             cap.set(cv2.CAP_PROP_POS_FRAMES, cand['frame_idx'])
             ret, frame = cap.read()
             if not ret or frame is None: continue
@@ -156,7 +153,7 @@ def analyze_cheer_flyer_descent(video_path, raw_frames, max_jump_distance=180.0,
             cap.release()
             return []
 
-        # ★ 決定打：「足首/つま先（ankle_y）」が画面上で一番高くなった（Y数値が一番小さい）瞬間を最高到達点（ピーク）に設定！
+        # ★ 決定打：足首・つま先（ankle_y）が最も高い位置に達したコマ＝【最高到達点 兼 最大開脚】
         peak_detection = min(valid_flyer_candidates, key=lambda x: x['ankle_y'])
 
         peak_frame_idx = peak_detection['frame_idx']
@@ -220,11 +217,11 @@ def render_flyer_capture(video_path, flyer_data):
             cv2.line(frame, (kpts[p1][0], kpts[p1][1]), (kpts[p2][0], kpts[p2][1]), (0, 255, 0), 2)
 
     s_ang = flyer_data.get('split_angle')
-    a_ang = flyer_data.get('arch_angle')
+    p_ang = flyer_data.get('arch_angle')
     
     cv2.putText(frame, f"Frame: {flyer_data['frame_idx']} | Conf: {int(flyer_data['conf']*100)}%", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-    cv2.putText(frame, f"Split (Toe): {s_ang if s_ang is not None else 'N/A'} deg", (20, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-    cv2.putText(frame, f"Arch (Back): {a_ang if a_ang is not None else 'N/A'} deg", (20, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 150, 0), 2)
+    cv2.putText(frame, f"Split Angle: {s_ang if s_ang is not None else 'N/A'} deg", (20, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+    cv2.putText(frame, f"Body Posture: {p_ang if p_ang is not None else 'N/A'} deg", (20, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 150, 0), 2)
 
     return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
