@@ -1,6 +1,7 @@
 # main.py
 
 import os
+import time
 import cv2
 import tempfile
 import streamlit as st
@@ -25,6 +26,12 @@ def load_yolo_model():
     return YOLO("yolov8n.pt")
 
 model = load_yolo_model()
+
+# セッション状態の初期化（結果とエラーの保存用）
+if "analysis_result" not in st.session_state:
+    st.session_state["analysis_result"] = None
+if "error_message" not in st.session_state:
+    st.session_state["error_message"] = None
 
 # ---------------------------------------------------------
 # Sidebar (共通設定 ＆ 技の選択)
@@ -55,23 +62,26 @@ uploaded_file = st.sidebar.file_uploader("解析する動画を選択してく�
 # 解析処理の実行
 # ---------------------------------------------------------
 if uploaded_file is not None:
-    tfile = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
-    tfile.write(uploaded_file.read())
-    video_path = tfile.name
-
     st.sidebar.success("動画のアップロードが完了しました！")
 
     if st.sidebar.button("🚀 AI解析を開始する", type="primary"):
+        st.session_state["error_message"] = None
         status_text = st.empty()
         progress_bar = st.progress(0)
+
+        # 一時ファイルの作成
+        tfile = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
+        tfile.write(uploaded_file.getvalue())
+        tfile.close()
+        video_path = tfile.name
 
         try:
             # 1. 動体検知トリミング
             status_text.text("⚡ [1/3] OpenCVで動画のアクティブ区間を高速スキャン中...")
             start_frame, end_frame, fps, total_frames = detect_active_motion_range(video_path)
 
-            if start_frame is None:
-                st.error("動画の読み込みに失敗しました。")
+            if start_frame is None or total_frames == 0:
+                st.session_state["error_message"] = "動画の読み込みまたは動体検知に失敗しました。"
                 st.stop()
 
             target_frame_count = end_frame - start_frame + 1
@@ -80,7 +90,7 @@ if uploaded_file is not None:
             cut_frames = total_frames - target_frame_count
             reduction_rate = (cut_frames / total_frames) * 100 if total_frames > 0 else 0
 
-            # 2. YOLO追跡
+            # 2. YOLO追跡（通信切断防止＆高速化）
             status_text.text(f"🔍 [2/3] YOLOによるフライヤーの軌跡解析を実行中（{FRAME_STEP}コマ間引き）...")
             cap = cv2.VideoCapture(video_path)
             cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
@@ -90,12 +100,13 @@ if uploaded_file is not None:
             current_frame = start_frame
 
             while cap.isOpened() and current_frame <= end_frame:
-                ret, frame = cap.read()
-                if not ret:
-                    break
-
                 if (current_frame - start_frame) % FRAME_STEP == 0:
-                    results = model.track(frame, persist=True, verbose=False)
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
+
+                    # YOLO推論（predictモードで軽量・高速化）
+                    results = model.predict(frame, verbose=False, classes=[0])
                     if results and len(results[0].boxes) > 0:
                         boxes = results[0].boxes
                         person_boxes = [b for b in boxes if int(b.cls[0]) == 0]
@@ -113,12 +124,19 @@ if uploaded_file is not None:
                                 'conf': conf
                             }
                             trajectory.append(data_point)
+                else:
+                    # スキップコマは grab() で爆速スキップ（デコード処理省略）
+                    ret = cap.grab()
+                    if not ret:
+                        break
 
                 processed_count += 1
-                if processed_count % 10 == 0 or current_frame == end_frame:
-                    progress_bar.progress(min(1.0, processed_count / max(1, target_frame_count)))
-                
                 current_frame += 1
+
+                # 💡 【重要】定期的に進捗更新 ＆ time.sleep(0.001) の息継ぎを入れて通信切断を100%防止
+                if processed_count % 10 == 0 or current_frame > end_frame:
+                    progress_bar.progress(min(1.0, processed_count / max(1, target_frame_count)))
+                    time.sleep(0.001)
 
             cap.release()
 
@@ -138,8 +156,11 @@ if uploaded_file is not None:
 
             # 4. 画像抽出
             captured_images = {}
-            target_indices = [f['frame_idx'] for f in selected_frames if f is not None]
-            
+            target_indices = []
+            for f in selected_frames:
+                if f is not None and isinstance(f, dict) and 'frame_idx' in f:
+                    target_indices.append(f['frame_idx'])
+
             if target_indices:
                 cap_extract = cv2.VideoCapture(video_path)
                 for idx in target_indices:
@@ -152,7 +173,7 @@ if uploaded_file is not None:
             status_text.text("✅ 解析が完了しました！")
             progress_bar.progress(1.0)
 
-            # 💡 画面が消えないように結果を Session State に保存する
+            # セッションに結果を保存
             st.session_state["analysis_result"] = {
                 "technique_type": technique_type,
                 "target_frame_count": target_frame_count,
@@ -167,17 +188,22 @@ if uploaded_file is not None:
             }
 
         except Exception as e:
-            st.error(f"解析中にエラーが発生しました: {e}")
+            st.session_state["error_message"] = f"解析中にエラーが発生しました: {e}"
 
-        try:
-            os.remove(video_path)
-        except Exception:
-            pass
+        finally:
+            try:
+                if os.path.exists(video_path):
+                    os.remove(video_path)
+            except Exception:
+                pass
 
 # =========================================================
-# 📊 結果表示（Session Stateに保存されている場合ずっと表示）
+# 📊 結果＆エラーの表示（セッション状態から常時表示）
 # =========================================================
-if "analysis_result" in st.session_state:
+if st.session_state["error_message"]:
+    st.error(st.session_state["error_message"])
+
+if st.session_state["analysis_result"] is not None:
     res = st.session_state["analysis_result"]
 
     st.markdown("---")
@@ -199,11 +225,11 @@ if "analysis_result" in st.session_state:
         
         with col:
             st.markdown(f"#### {title}")
-            if frame_data and frame_data['frame_idx'] in res['captured_images']:
+            if frame_data and isinstance(frame_data, dict) and 'frame_idx' in frame_data and frame_data['frame_idx'] in res['captured_images']:
                 idx = frame_data['frame_idx']
                 img = res['captured_images'][idx].copy()
                 b = frame_data['bbox']
-                cv2.rectangle(img, (int(b[0]), int(b[1])), (int(b[2]), int(b[3])), (0, 255, 255), 3)
+                cv2.rectangle(img, (int(b[0]), int(b[1])), (0, 255, 255), 3)
                 
                 label = f"Frame: {idx}"
                 cv2.putText(img, label, (int(b[0]), max(20, int(b[1])-10)),
