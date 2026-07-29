@@ -1,4 +1,5 @@
 # main.py
+
 import os
 import cv2
 import tempfile
@@ -8,9 +9,8 @@ from ultralytics import YOLO
 # 共通モジュールのインポート
 from common.motion_trimmer import detect_active_motion_range
 
-# 技別モジュールのインポート（※ソロ用モジュールができたら追加）
+# 技別モジュールのインポート
 from techniques import toe_touch_toss
-# from techniques import solo_jump  # ←将来的にソロ用を作成した際に追加
 
 # ---------------------------------------------------------
 # Page Configuration & Model Load
@@ -35,11 +35,11 @@ technique_type = st.sidebar.selectbox(
     ["トータッチ・トス", "ソロジャンプ"]
 )
 
-# 💡 コマ間引き（処理スピード）の選択を追加（デフォルトは2倍速）
+# コマ間引き設定
 speed_option = st.sidebar.radio(
     "⚡ 解析スピード設定",
     ["爆速（3コマに1コマ解析 / 3倍速）", "標準（2コマに1コマ解析 / 2倍速）", "精密（全コマ解析）"],
-    index=1
+    index=0  # 長い動画でも確実に快適に動くようデフォルトを「爆速」に設定
 )
 
 if "3倍速" in speed_option:
@@ -82,14 +82,13 @@ if uploaded_file is not None:
             reduction_rate = (cut_frames / total_frames) * 100 if total_frames > 0 else 0
 
             # ---------------------------------------------------------
-            # 2. 【完全共通処理】YOLOによる物体追跡（コマ間引き＆通信切断防止）
+            # 2. 【完全共通処理】YOLOによる物体追跡（軽量化＆メモリ安全化）
             # ---------------------------------------------------------
             status_text.text(f"🔍 [2/3] YOLOによるフライヤーの軌跡解析を実行中（{FRAME_STEP}コマ間引き）...")
             cap = cv2.VideoCapture(video_path)
             cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
 
             trajectory = []
-            captured_images = {}
             processed_count = 0
             current_frame = start_frame
 
@@ -98,7 +97,7 @@ if uploaded_file is not None:
                 if not ret:
                     break
 
-                # 💡 間引き判定：設定したステップ（例: 2コマまたは3コマごと）のみ重いAI処理を実行
+                # 💡 間引き判定：設定したステップのみ重いAI処理を実行
                 if (current_frame - start_frame) % FRAME_STEP == 0:
                     results = model.track(frame, persist=True, verbose=False)
                     if results and len(results[0].boxes) > 0:
@@ -118,11 +117,14 @@ if uploaded_file is not None:
                                 'conf': conf
                             }
                             trajectory.append(data_point)
-                            captured_images[current_frame] = frame.copy()
+                            # ⚠️ メモリオーバー防止：ここでは全画像を保持せず、後で必要な4コマだけ抽出します
 
                 processed_count += 1
-                # 💡 毎フレーム進捗を画面に送り、Cloud Run の無通信タイムアウト（画面が白くなる現象）を確実に防止
-                progress_bar.progress(min(1.0, processed_count / max(1, target_frame_count)))
+                
+                # 💡 通信過多防止：10コマに1回だけ進捗を画面に送信して通信切断を防止
+                if processed_count % 10 == 0 or current_frame == end_frame:
+                    progress_bar.progress(min(1.0, processed_count / max(1, target_frame_count)))
+                
                 current_frame += 1
 
             cap.release()
@@ -138,11 +140,23 @@ if uploaded_file is not None:
                 phase_names = ["① 空中初期", "② ピーク直前", "③ 最高到達点", "④ 反り・着地"]
                 selected_frames = [f1, f2, f3, f4]
             else:
-                # ソロジャンプの場合（現在は仮でトスと同じ判定を適用、後でソロ用に変更可能）
                 f1, f2, f3, f4 = toe_touch_toss.select_best_frames(trajectory)
                 diagnoses = toe_touch_toss.generate_diagnosis(f1, f2, f3, f4, trajectory)
                 phase_names = ["① 離空・踏み切り", "② 膝の溜め", "③ 最高到達点(開脚)", "④ 着地姿勢"]
                 selected_frames = [f1, f2, f3, f4]
+
+            # 💡 【追加】選ばれた4コマだけを動画からピンポイントで読み込む（メモリ節約＆爆速）
+            captured_images = {}
+            target_indices = [f['frame_idx'] for f in selected_frames if f is not None]
+            
+            if target_indices:
+                cap_extract = cv2.VideoCapture(video_path)
+                for idx in target_indices:
+                    cap_extract.set(cv2.CAP_PROP_POS_FRAMES, idx)
+                    ret_ex, frame_ex = cap_extract.read()
+                    if ret_ex:
+                        captured_images[idx] = frame_ex
+                cap_extract.release()
 
             status_text.text("✅ 解析が完了しました！")
             progress_bar.progress(1.0)
