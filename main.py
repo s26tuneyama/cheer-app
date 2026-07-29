@@ -39,7 +39,7 @@ technique_type = st.sidebar.selectbox(
 speed_option = st.sidebar.radio(
     "⚡ 解析スピード設定",
     ["爆速（3コマに1コマ解析 / 3倍速）", "標準（2コマに1コマ解析 / 2倍速）", "精密（全コマ解析）"],
-    index=0  # 長い動画でも確実に快適に動くようデフォルトを「爆速」に設定
+    index=0
 )
 
 if "3倍速" in speed_option:
@@ -51,6 +51,9 @@ else:
 
 uploaded_file = st.sidebar.file_uploader("解析する動画を選択してください", type=["mp4", "mov", "avi"])
 
+# ---------------------------------------------------------
+# 解析処理の実行
+# ---------------------------------------------------------
 if uploaded_file is not None:
     tfile = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
     tfile.write(uploaded_file.read())
@@ -63,9 +66,7 @@ if uploaded_file is not None:
         progress_bar = st.progress(0)
 
         try:
-            # ---------------------------------------------------------
-            # 1. 【完全共通処理】爆速動体検知トリミング
-            # ---------------------------------------------------------
+            # 1. 動体検知トリミング
             status_text.text("⚡ [1/3] OpenCVで動画のアクティブ区間を高速スキャン中...")
             start_frame, end_frame, fps, total_frames = detect_active_motion_range(video_path)
 
@@ -74,16 +75,12 @@ if uploaded_file is not None:
                 st.stop()
 
             target_frame_count = end_frame - start_frame + 1
-
-            # パフォーマンス数値の計算
             orig_sec = total_frames / fps if fps > 0 else 0
             trimmed_sec = target_frame_count / fps if fps > 0 else 0
             cut_frames = total_frames - target_frame_count
             reduction_rate = (cut_frames / total_frames) * 100 if total_frames > 0 else 0
 
-            # ---------------------------------------------------------
-            # 2. 【完全共通処理】YOLOによる物体追跡（軽量化＆メモリ安全化）
-            # ---------------------------------------------------------
+            # 2. YOLO追跡
             status_text.text(f"🔍 [2/3] YOLOによるフライヤーの軌跡解析を実行中（{FRAME_STEP}コマ間引き）...")
             cap = cv2.VideoCapture(video_path)
             cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
@@ -97,7 +94,6 @@ if uploaded_file is not None:
                 if not ret:
                     break
 
-                # 💡 間引き判定：設定したステップのみ重いAI処理を実行
                 if (current_frame - start_frame) % FRAME_STEP == 0:
                     results = model.track(frame, persist=True, verbose=False)
                     if results and len(results[0].boxes) > 0:
@@ -117,11 +113,8 @@ if uploaded_file is not None:
                                 'conf': conf
                             }
                             trajectory.append(data_point)
-                            # ⚠️ メモリオーバー防止：ここでは全画像を保持せず、後で必要な4コマだけ抽出します
 
                 processed_count += 1
-                
-                # 💡 通信過多防止：10コマに1回だけ進捗を画面に送信して通信切断を防止
                 if processed_count % 10 == 0 or current_frame == end_frame:
                     progress_bar.progress(min(1.0, processed_count / max(1, target_frame_count)))
                 
@@ -129,9 +122,7 @@ if uploaded_file is not None:
 
             cap.release()
 
-            # ---------------------------------------------------------
-            # 3. 【技別処理の分岐】選択された技のモジュールを呼び出す
-            # ---------------------------------------------------------
+            # 3. 技別診断
             status_text.text("🧠 [3/3] AIフォーム診断およびコマ選出中...")
             
             if technique_type == "トータッチ・トス":
@@ -145,7 +136,7 @@ if uploaded_file is not None:
                 phase_names = ["① 離空・踏み切り", "② 膝の溜め", "③ 最高到達点(開脚)", "④ 着地姿勢"]
                 selected_frames = [f1, f2, f3, f4]
 
-            # 💡 【追加】選ばれた4コマだけを動画からピンポイントで読み込む（メモリ節約＆爆速）
+            # 4. 画像抽出
             captured_images = {}
             target_indices = [f['frame_idx'] for f in selected_frames if f is not None]
             
@@ -160,52 +151,20 @@ if uploaded_file is not None:
 
             status_text.text("✅ 解析が完了しました！")
             progress_bar.progress(1.0)
-            st.balloons()
 
-            # =========================================================
-            # 📊 結果表示（共通画面表示）
-            # =========================================================
-            st.markdown("---")
-            st.subheader("⚡ 解析パフォーマンス（自動トリミング結果）")
-            
-            col_m1, col_m2, col_m3 = st.columns(3)
-            col_m1.metric("解析フレーム数", f"{target_frame_count} コマ", f"-{cut_frames} コマカット")
-            col_m2.metric("解析動画サイズ", f"{trimmed_sec:.1f} 秒", f"-{orig_sec - trimmed_sec:.1f} 秒短縮")
-            col_m3.metric("無駄時間の削減率", f"{reduction_rate:.1f} %", "処理速度大幅UP!")
-
-            st.markdown("---")
-            st.subheader(f"📷 {technique_type} : 動作プロセスのコマ撮り")
-            
-            cols = st.columns(4)
-            for i in range(4):
-                title = phase_names[i]
-                frame_data = selected_frames[i]
-                col = cols[i]
-                
-                with col:
-                    st.markdown(f"#### {title}")
-                    if frame_data and frame_data['frame_idx'] in captured_images:
-                        idx = frame_data['frame_idx']
-                        img = captured_images[idx].copy()
-                        b = frame_data['bbox']
-                        cv2.rectangle(img, (int(b[0]), int(b[1])), (int(b[2]), int(b[3])), (0, 255, 255), 3)
-                        
-                        label = f"Frame: {idx}"
-                        cv2.putText(img, label, (int(b[0]), max(20, int(b[1])-10)),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-
-                        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                        try:
-                            st.image(img_rgb, use_container_width=True)
-                        except TypeError:
-                            st.image(img_rgb, use_column_width=True)
-                    else:
-                        st.warning("検出不可")
-
-            st.markdown("---")
-            st.subheader("📋 AIフォーム診断レポート")
-            for diag in diagnoses:
-                st.markdown(diag)
+            # 💡 画面が消えないように結果を Session State に保存する
+            st.session_state["analysis_result"] = {
+                "technique_type": technique_type,
+                "target_frame_count": target_frame_count,
+                "cut_frames": cut_frames,
+                "trimmed_sec": trimmed_sec,
+                "orig_sec": orig_sec,
+                "reduction_rate": reduction_rate,
+                "phase_names": phase_names,
+                "selected_frames": selected_frames,
+                "captured_images": captured_images,
+                "diagnoses": diagnoses
+            }
 
         except Exception as e:
             st.error(f"解析中にエラーが発生しました: {e}")
@@ -214,3 +173,52 @@ if uploaded_file is not None:
             os.remove(video_path)
         except Exception:
             pass
+
+# =========================================================
+# 📊 結果表示（Session Stateに保存されている場合ずっと表示）
+# =========================================================
+if "analysis_result" in st.session_state:
+    res = st.session_state["analysis_result"]
+
+    st.markdown("---")
+    st.subheader("⚡ 解析パフォーマンス（自動トリミング結果）")
+    
+    col_m1, col_m2, col_m3 = st.columns(3)
+    col_m1.metric("解析フレーム数", f"{res['target_frame_count']} コマ", f"-{res['cut_frames']} コマカット")
+    col_m2.metric("解析動画サイズ", f"{res['trimmed_sec']:.1f} 秒", f"-{res['orig_sec'] - res['trimmed_sec']:.1f} 秒短縮")
+    col_m3.metric("無駄時間の削減率", f"{res['reduction_rate']:.1f} %", "処理速度大幅UP!")
+
+    st.markdown("---")
+    st.subheader(f"📷 {res['technique_type']} : 動作プロセスのコマ撮り")
+    
+    cols = st.columns(4)
+    for i in range(4):
+        title = res['phase_names'][i]
+        frame_data = res['selected_frames'][i]
+        col = cols[i]
+        
+        with col:
+            st.markdown(f"#### {title}")
+            if frame_data and frame_data['frame_idx'] in res['captured_images']:
+                idx = frame_data['frame_idx']
+                img = res['captured_images'][idx].copy()
+                b = frame_data['bbox']
+                cv2.rectangle(img, (int(b[0]), int(b[1])), (int(b[2]), int(b[3])), (0, 255, 255), 3)
+                
+                label = f"Frame: {idx}"
+                cv2.putText(img, label, (int(b[0]), max(20, int(b[1])-10)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+
+                img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                try:
+                    st.image(img_rgb, use_container_width=True)
+                except TypeError:
+                    st.image(img_rgb, use_column_width=True)
+            else:
+                st.warning("検出不可")
+
+    st.markdown("---")
+    st.subheader("📋 AIフォーム診断レポート")
+    for diag in res['diagnoses']:
+        st.markdown(diag)
+
