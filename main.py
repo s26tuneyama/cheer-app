@@ -57,46 +57,11 @@ if uploaded_file is not None:
 
         target_frame_count = end_frame - start_frame + 1
 
-        # --- デバッグ用：トリミング数値の計算 ---
+        # デバッグ用データの計算
         orig_sec = total_frames / fps
         trimmed_sec = target_frame_count / fps
         cut_frames = total_frames - target_frame_count
         reduction_rate = (cut_frames / total_frames) * 100 if total_frames > 0 else 0
-
-        # --- デバッグ情報の表示（UI表示） ---
-        st.success("🎬 **トリミング成功！ 画面の動きから技の前後を自動抽出しました**")
-
-        # 3列のカード（Metrics）で比較表示
-        m1, m2, m3 = st.columns(3)
-        with m1:
-            st.metric(
-                label="解析フレーム数", 
-                value=f"{target_frame_count} コマ", 
-                delta=f"-{cut_frames} コマカット",
-                delta_color="normal"
-            )
-        with m2:
-            st.metric(
-                label="解析動画サイズ", 
-                value=f"{trimmed_sec:.1f} 秒", 
-                delta=f"-{orig_sec - trimmed_sec:.1f} 秒短縮",
-                delta_color="normal"
-            )
-        with m3:
-            st.metric(
-                label="無駄時間の削減率", 
-                value=f"{reduction_rate:.1f} %", 
-                delta="処理速度UP!",
-                delta_color="normal"
-            )
-
-        # アコーディオンで詳細なコマ番号を表示（デバッグ用）
-        with st.expander("🛠️ トリミング詳細デバッグデータ"):
-            st.write(f"- **元動画全体**: Frame 0 〜 {total_frames - 1} ({orig_sec:.2f}秒 / {total_frames}コマ)")
-            st.write(f"- **抽出された範囲**: **Frame {start_frame} 〜 {end_frame}** ({trimmed_sec:.2f}秒 / {target_frame_count}コマ)")
-            st.write(f"- **動画FPS**: {fps:.2f} fps")
-
-        st.divider()
 
         # ---------------------------------------------------------
         # 【YOLO推論】特定区間のみトラッキング（高速解析）
@@ -120,23 +85,19 @@ if uploaded_file is not None:
             # YOLOで人物検出
             results = model.track(frame, persist=True, verbose=False)
             
-            # 最も信頼度の高い（あるいは一番上の）人物BBoxを取得
             if results and len(results[0].boxes) > 0:
                 boxes = results[0].boxes
-                # 人物クラス(cls == 0)の検出結果を抽出
                 person_boxes = [b for b in boxes if int(b.cls[0]) == 0]
                 
                 if person_boxes:
-                    # 画面内で最も高い位置（Y最小）にいる人物、または自信度最高をフライヤーと判定
                     best_box = max(person_boxes, key=lambda b: float(b.conf[0]))
-                    xyxy = best_box.xyxy[0].cpu().numpy()  # [x1, y1, x2, y2]
+                    xyxy = best_box.xyxy[0].cpu().numpy()
                     conf = float(best_box.conf[0])
                     
                     x1, y1, x2, y2 = xyxy
                     center_x = (x1 + x2) / 2.0
                     center_y = (y1 + y2) / 2.0
 
-                    # 軌跡データへの格納
                     data_point = {
                         'frame_idx': current_frame,
                         'bbox': [float(x1), float(y1), float(x2), float(y2)],
@@ -146,7 +107,6 @@ if uploaded_file is not None:
                     trajectory.append(data_point)
                     captured_images[current_frame] = frame.copy()
 
-            # プログレスバーの更新
             processed_count += 1
             progress_bar.progress(min(1.0, processed_count / max(1, target_frame_count)))
             current_frame += 1
@@ -165,9 +125,44 @@ if uploaded_file is not None:
         progress_bar.progress(1.0)
         st.balloons()
 
-        # ---------------------------------------------------------
-        # 画面表示1：動作プロセスのコマ撮り
-        # ---------------------------------------------------------
+        # =========================================================
+        # 📊 結果表示エリア（一括出力）
+        # =========================================================
+
+        # 1. 自動トリミング・パフォーマンス結果
+        st.subheader("⚡ 解析パフォーマンス（自動トリミング結果）")
+        
+        m1, m2, m3 = st.columns(3)
+        with m1:
+            st.metric(
+                label="解析フレーム数", 
+                value=f"{target_frame_count} コマ", 
+                delta=f"-{cut_frames} コマカット",
+                delta_color="normal"
+            )
+        with m2:
+            st.metric(
+                label="解析動画サイズ", 
+                value=f"{trimmed_sec:.1f} 秒", 
+                delta=f"-{orig_sec - trimmed_sec:.1f} 秒短縮",
+                delta_color="normal"
+            )
+        with m3:
+            st.metric(
+                label="無駄時間の削減率", 
+                value=f"{reduction_rate:.1f} %", 
+                delta="処理速度UP!",
+                delta_color="normal"
+            )
+
+        with st.expander("🛠️ トリミング詳細デバッグデータ"):
+            st.write(f"- **元動画全体**: Frame 0 〜 {total_frames - 1} ({orig_sec:.2f}秒 / {total_frames}コマ)")
+            st.write(f"- **抽出された範囲**: **Frame {start_frame} 〜 {end_frame}** ({trimmed_sec:.2f}秒 / {target_frame_count}コマ)")
+            st.write(f"- **動画FPS**: {fps:.2f} fps")
+
+        st.divider()
+
+        # 2. 動作プロセスのコマ撮り
         st.subheader("📷 動作プロセスのコマ撮り")
         col1, col2, col3, col4 = st.columns(4)
 
@@ -185,16 +180,13 @@ if uploaded_file is not None:
                     idx = frame_data['frame_idx']
                     img = captured_images[idx].copy()
                     
-                    # BBoxの描画（黄色い枠）
                     b = frame_data['bbox']
                     cv2.rectangle(img, (int(b[0]), int(b[1])), (int(b[2]), int(b[3])), (0, 255, 255), 3)
                     
-                    # フレーム番号と信頼度の描画
                     label = f"Frame: {idx} | Conf: {int(frame_data['conf']*100)}%"
                     cv2.putText(img, label, (int(b[0]), max(20, int(b[1])-10)),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
-                    # BGRからRGBに変換してStreamlit表示
                     img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
                     st.image(img_rgb, use_container_width=True)
                 else:
@@ -202,9 +194,7 @@ if uploaded_file is not None:
 
         st.divider()
 
-        # ---------------------------------------------------------
-        # 画面表示2：AIフォーム診断レポート
-        # ---------------------------------------------------------
+        # 3. AIフォーム診断レポート
         st.subheader("📋 AIフォーム診断レポート")
         for diag in diagnoses:
             st.markdown(diag)
