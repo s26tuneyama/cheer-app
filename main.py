@@ -35,6 +35,20 @@ technique_type = st.sidebar.selectbox(
     ["トータッチ・トス", "ソロジャンプ"]
 )
 
+# 💡 コマ間引き（処理スピード）の選択を追加（デフォルトは2倍速）
+speed_option = st.sidebar.radio(
+    "⚡ 解析スピード設定",
+    ["爆速（3コマに1コマ解析 / 3倍速）", "標準（2コマに1コマ解析 / 2倍速）", "精密（全コマ解析）"],
+    index=1
+)
+
+if "3倍速" in speed_option:
+    FRAME_STEP = 3
+elif "2倍速" in speed_option:
+    FRAME_STEP = 2
+else:
+    FRAME_STEP = 1
+
 uploaded_file = st.sidebar.file_uploader("解析する動画を選択してください", type=["mp4", "mov", "avi"])
 
 if uploaded_file is not None:
@@ -68,9 +82,9 @@ if uploaded_file is not None:
             reduction_rate = (cut_frames / total_frames) * 100 if total_frames > 0 else 0
 
             # ---------------------------------------------------------
-            # 2. 【完全共通処理】YOLOによる物体追跡
+            # 2. 【完全共通処理】YOLOによる物体追跡（コマ間引き＆通信切断防止）
             # ---------------------------------------------------------
-            status_text.text("🔍 [2/3] YOLOによるフライヤーの軌跡解析を実行中...")
+            status_text.text(f"🔍 [2/3] YOLOによるフライヤーの軌跡解析を実行中（{FRAME_STEP}コマ間引き）...")
             cap = cv2.VideoCapture(video_path)
             cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
 
@@ -84,27 +98,30 @@ if uploaded_file is not None:
                 if not ret:
                     break
 
-                results = model.track(frame, persist=True, verbose=False)
-                if results and len(results[0].boxes) > 0:
-                    boxes = results[0].boxes
-                    person_boxes = [b for b in boxes if int(b.cls[0]) == 0]
-                    
-                    if person_boxes:
-                        best_box = max(person_boxes, key=lambda b: float(b.conf[0]))
-                        xyxy = best_box.xyxy[0].cpu().numpy()
-                        conf = float(best_box.conf[0])
+                # 💡 間引き判定：設定したステップ（例: 2コマまたは3コマごと）のみ重いAI処理を実行
+                if (current_frame - start_frame) % FRAME_STEP == 0:
+                    results = model.track(frame, persist=True, verbose=False)
+                    if results and len(results[0].boxes) > 0:
+                        boxes = results[0].boxes
+                        person_boxes = [b for b in boxes if int(b.cls[0]) == 0]
                         
-                        x1, y1, x2, y2 = xyxy
-                        data_point = {
-                            'frame_idx': current_frame,
-                            'bbox': [float(x1), float(y1), float(x2), float(y2)],
-                            'center': [(x1 + x2) / 2.0, (y1 + y2) / 2.0],
-                            'conf': conf
-                        }
-                        trajectory.append(data_point)
-                        captured_images[current_frame] = frame.copy()
+                        if person_boxes:
+                            best_box = max(person_boxes, key=lambda b: float(b.conf[0]))
+                            xyxy = best_box.xyxy[0].cpu().numpy()
+                            conf = float(best_box.conf[0])
+                            
+                            x1, y1, x2, y2 = xyxy
+                            data_point = {
+                                'frame_idx': current_frame,
+                                'bbox': [float(x1), float(y1), float(x2), float(y2)],
+                                'center': [(x1 + x2) / 2.0, (y1 + y2) / 2.0],
+                                'conf': conf
+                            }
+                            trajectory.append(data_point)
+                            captured_images[current_frame] = frame.copy()
 
                 processed_count += 1
+                # 💡 毎フレーム進捗を画面に送り、Cloud Run の無通信タイムアウト（画面が白くなる現象）を確実に防止
                 progress_bar.progress(min(1.0, processed_count / max(1, target_frame_count)))
                 current_frame += 1
 
@@ -183,4 +200,3 @@ if uploaded_file is not None:
             os.remove(video_path)
         except Exception:
             pass
-
