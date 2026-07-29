@@ -5,23 +5,21 @@ import tempfile
 import streamlit as st
 from ultralytics import YOLO
 
-# 自作モジュールのインポート
+# 共通モジュールのインポート
 from common.motion_trimmer import detect_active_motion_range
-from techniques.toe_touch_toss import select_best_frames, generate_diagnosis
+
+# 技別モジュールのインポート（※ソロ用モジュールができたら追加）
+from techniques import toe_touch_toss
+# from techniques import solo_jump  # ←将来的にソロ用を作成した際に追加
 
 # ---------------------------------------------------------
-# Page Configuration
+# Page Configuration & Model Load
 # ---------------------------------------------------------
-st.set_page_config(
-    page_title="Cheer AI Form Analyzer",
-    page_icon="📣",
-    layout="wide"
-)
+st.set_page_config(page_title="Cheer AI Form Analyzer", page_icon="📣", layout="wide")
 
 st.title("📣 チアリーディング AI フォーム解析")
 st.write("動画をアップロードすると、AIが技の主要コマを自動選出＆フォーム診断を行います。")
 
-# YOLOモデルのロード
 @st.cache_resource
 def load_yolo_model():
     return YOLO("yolov8n.pt")
@@ -29,8 +27,14 @@ def load_yolo_model():
 model = load_yolo_model()
 
 # ---------------------------------------------------------
-# Sidebar / File Uploader
+# Sidebar (共通設定 ＆ 技の選択)
 # ---------------------------------------------------------
+st.sidebar.header("⚙️ 解析設定")
+technique_type = st.sidebar.selectbox(
+    "解析する技を選択してください",
+    ["トータッチ・トス", "ソロジャンプ"]
+)
+
 uploaded_file = st.sidebar.file_uploader("解析する動画を選択してください", type=["mp4", "mov", "avi"])
 
 if uploaded_file is not None:
@@ -46,9 +50,9 @@ if uploaded_file is not None:
 
         try:
             # ---------------------------------------------------------
-            # 【第1段階】共通動体検知トリミング（爆速粗削り）
+            # 1. 【完全共通処理】爆速動体検知トリミング
             # ---------------------------------------------------------
-            status_text.text("⚡ [1/3] OpenCVで動画の技発生エリア（アクティブ区間）を高速スキャン中...")
+            status_text.text("⚡ [1/3] OpenCVで動画のアクティブ区間を高速スキャン中...")
             start_frame, end_frame, fps, total_frames = detect_active_motion_range(video_path)
 
             if start_frame is None:
@@ -57,23 +61,21 @@ if uploaded_file is not None:
 
             target_frame_count = end_frame - start_frame + 1
 
-            # デバッグ用データの計算
+            # パフォーマンス数値の計算
             orig_sec = total_frames / fps if fps > 0 else 0
             trimmed_sec = target_frame_count / fps if fps > 0 else 0
             cut_frames = total_frames - target_frame_count
             reduction_rate = (cut_frames / total_frames) * 100 if total_frames > 0 else 0
 
             # ---------------------------------------------------------
-            # 【YOLO推論】特定区間のみトラッキング（高速解析）
+            # 2. 【完全共通処理】YOLOによる物体追跡
             # ---------------------------------------------------------
             status_text.text("🔍 [2/3] YOLOによるフライヤーの軌跡解析を実行中...")
-            
             cap = cv2.VideoCapture(video_path)
             cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
 
             trajectory = []
             captured_images = {}
-            
             processed_count = 0
             current_frame = start_frame
 
@@ -83,7 +85,6 @@ if uploaded_file is not None:
                     break
 
                 results = model.track(frame, persist=True, verbose=False)
-                
                 if results and len(results[0].boxes) > 0:
                     boxes = results[0].boxes
                     person_boxes = [b for b in boxes if int(b.cls[0]) == 0]
@@ -94,13 +95,10 @@ if uploaded_file is not None:
                         conf = float(best_box.conf[0])
                         
                         x1, y1, x2, y2 = xyxy
-                        center_x = (x1 + x2) / 2.0
-                        center_y = (y1 + y2) / 2.0
-
                         data_point = {
                             'frame_idx': current_frame,
                             'bbox': [float(x1), float(y1), float(x2), float(y2)],
-                            'center': [center_x, center_y],
+                            'center': [(x1 + x2) / 2.0, (y1 + y2) / 2.0],
                             'conf': conf
                         }
                         trajectory.append(data_point)
@@ -113,65 +111,59 @@ if uploaded_file is not None:
             cap.release()
 
             # ---------------------------------------------------------
-            # 【判定ロジック】主要4コマの自動選出 ＆ AI診断レポート生成
+            # 3. 【技別処理の分岐】選択された技のモジュールを呼び出す
             # ---------------------------------------------------------
-            status_text.text("🧠 [3/3] AIフォーム診断およびベストコマ選出中...")
+            status_text.text("🧠 [3/3] AIフォーム診断およびコマ選出中...")
             
-            f1, f2, f3, f4 = select_best_frames(trajectory)
-            diagnoses = generate_diagnosis(f1, f2, f3, f4, trajectory)
+            if technique_type == "トータッチ・トス":
+                f1, f2, f3, f4 = toe_touch_toss.select_best_frames(trajectory)
+                diagnoses = toe_touch_toss.generate_diagnosis(f1, f2, f3, f4, trajectory)
+                phase_names = ["① 空中初期", "② ピーク直前", "③ 最高到達点", "④ 反り・着地"]
+                selected_frames = [f1, f2, f3, f4]
+            else:
+                # ソロジャンプの場合（現在は仮でトスと同じ判定を適用、後でソロ用に変更可能）
+                f1, f2, f3, f4 = toe_touch_toss.select_best_frames(trajectory)
+                diagnoses = toe_touch_toss.generate_diagnosis(f1, f2, f3, f4, trajectory)
+                phase_names = ["① 離空・踏み切り", "② 膝の溜め", "③ 最高到達点(開脚)", "④ 着地姿勢"]
+                selected_frames = [f1, f2, f3, f4]
 
             status_text.text("✅ 解析が完了しました！")
             progress_bar.progress(1.0)
             st.balloons()
 
             # =========================================================
-            # 📊 結果表示エリア（安定的表示）
+            # 📊 結果表示（共通画面表示）
             # =========================================================
-
             st.markdown("---")
             st.subheader("⚡ 解析パフォーマンス（自動トリミング結果）")
             
-            # 安全な metric 表示（互換性エラー防止）
             col_m1, col_m2, col_m3 = st.columns(3)
             col_m1.metric("解析フレーム数", f"{target_frame_count} コマ", f"-{cut_frames} コマカット")
             col_m2.metric("解析動画サイズ", f"{trimmed_sec:.1f} 秒", f"-{orig_sec - trimmed_sec:.1f} 秒短縮")
             col_m3.metric("無駄時間の削減率", f"{reduction_rate:.1f} %", "処理速度大幅UP!")
 
-            with st.expander("🛠️ トリミング詳細デバッグデータ"):
-                st.write(f"- **元動画全体**: Frame 0 〜 {total_frames - 1} ({orig_sec:.2f}秒 / {total_frames}コマ)")
-                st.write(f"- **抽出された範囲**: **Frame {start_frame} 〜 {end_frame}** ({trimmed_sec:.2f}秒 / {target_frame_count}コマ)")
-                st.write(f"- **動画FPS**: {fps:.2f} fps")
-
             st.markdown("---")
-
-            # 2. 動作プロセスのコマ撮り
-            st.subheader("📷 動作プロセスのコマ撮り")
-            col1, col2, col3, col4 = st.columns(4)
-
-            phase_info = [
-                ("① 空中初期", f1, col1),
-                ("② ピーク直前", f2, col2),
-                ("③ 最高到達点", f3, col3),
-                ("④ 反り・着地", f4, col4)
-            ]
-
-            for title, frame_data, col in phase_info:
+            st.subheader(f"📷 {technique_type} : 動作プロセスのコマ撮り")
+            
+            cols = st.columns(4)
+            for i in range(4):
+                title = phase_names[i]
+                frame_data = selected_frames[i]
+                col = cols[i]
+                
                 with col:
                     st.markdown(f"#### {title}")
                     if frame_data and frame_data['frame_idx'] in captured_images:
                         idx = frame_data['frame_idx']
                         img = captured_images[idx].copy()
-                        
                         b = frame_data['bbox']
                         cv2.rectangle(img, (int(b[0]), int(b[1])), (int(b[2]), int(b[3])), (0, 255, 255), 3)
                         
-                        label = f"Frame: {idx} | Conf: {int(frame_data['conf']*100)}%"
+                        label = f"Frame: {idx}"
                         cv2.putText(img, label, (int(b[0]), max(20, int(b[1])-10)),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
                         img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                        
-                        # バージョン両対応の画像描画
                         try:
                             st.image(img_rgb, use_container_width=True)
                         except TypeError:
@@ -180,8 +172,6 @@ if uploaded_file is not None:
                         st.warning("検出不可")
 
             st.markdown("---")
-
-            # 3. AIフォーム診断レポート
             st.subheader("📋 AIフォーム診断レポート")
             for diag in diagnoses:
                 st.markdown(diag)
@@ -189,7 +179,6 @@ if uploaded_file is not None:
         except Exception as e:
             st.error(f"解析中にエラーが発生しました: {e}")
 
-        # 一時ファイルの削除
         try:
             os.remove(video_path)
         except Exception:
