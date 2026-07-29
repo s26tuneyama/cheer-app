@@ -24,7 +24,6 @@ st.write("動画をアップロードすると、AIが技の主要コマを自�
 # YOLOモデルのロード（キャッシュ化して2回目以降を高速化）
 @st.cache_resource
 def load_yolo_model():
-    # ※軽量化のため 'yolov8n.pt' またはお手持ちの学習済みモデルを指定
     return YOLO("yolov8n.pt")
 
 model = load_yolo_model()
@@ -57,7 +56,47 @@ if uploaded_file is not None:
             st.stop()
 
         target_frame_count = end_frame - start_frame + 1
-        st.info(f"🎬 全 {total_frames} コマ中、動きのある 【Frame {start_frame} 〜 {end_frame}】 ({target_frame_count} コマ) を解析対象に絞り込みました！")
+
+        # --- デバッグ用：トリミング数値の計算 ---
+        orig_sec = total_frames / fps
+        trimmed_sec = target_frame_count / fps
+        cut_frames = total_frames - target_frame_count
+        reduction_rate = (cut_frames / total_frames) * 100 if total_frames > 0 else 0
+
+        # --- デバッグ情報の表示（UI表示） ---
+        st.success("🎬 **トリミング成功！ 画面の動きから技の前後を自動抽出しました**")
+
+        # 3列のカード（Metrics）で比較表示
+        m1, m2, m3 = st.columns(3)
+        with m1:
+            st.metric(
+                label="解析フレーム数", 
+                value=f"{target_frame_count} コマ", 
+                delta=f"-{cut_frames} コマカット",
+                delta_color="normal"
+            )
+        with m2:
+            st.metric(
+                label="解析動画サイズ", 
+                value=f"{trimmed_sec:.1f} 秒", 
+                delta=f"-{orig_sec - trimmed_sec:.1f} 秒短縮",
+                delta_color="normal"
+            )
+        with m3:
+            st.metric(
+                label="無駄時間の削減率", 
+                value=f"{reduction_rate:.1f} %", 
+                delta="処理速度UP!",
+                delta_color="normal"
+            )
+
+        # アコーディオンで詳細なコマ番号を表示（デバッグ用）
+        with st.expander("🛠️ トリミング詳細デバッグデータ"):
+            st.write(f"- **元動画全体**: Frame 0 〜 {total_frames - 1} ({orig_sec:.2f}秒 / {total_frames}コマ)")
+            st.write(f"- **抽出された範囲**: **Frame {start_frame} 〜 {end_frame}** ({trimmed_sec:.2f}秒 / {target_frame_count}コマ)")
+            st.write(f"- **動画FPS**: {fps:.2f} fps")
+
+        st.divider()
 
         # ---------------------------------------------------------
         # 【YOLO推論】特定区間のみトラッキング（高速解析）
@@ -175,3 +214,4 @@ if uploaded_file is not None:
             os.remove(video_path)
         except Exception:
             pass
+
